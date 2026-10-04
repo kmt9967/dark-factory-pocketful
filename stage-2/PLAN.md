@@ -217,3 +217,7 @@ All stage-1 acceptance items 1–78 continue to hold (regression run of stage-1 
 - **W2b — UI:** items 79–102, 117–119 and 121, plus E8–E12, on top of the accepted W2a. Reviewed alone,
   including in a real headless browser at 375 px and 1280 px.
 - Verifier gate on the accepted W2b revision: stage-1 and stage-2 supplied suites, host and isolated.
+
+## Amendments
+
+- E4a (review of ba85eef, F1/F2): an authorisation with status `open` must have captured_amount < amount; otherwise reset/import → 422 with state unchanged. A capture whose resolved amount is < 1 never creates a payment (nothing remaining ⇒ 409 `authorization_not_open`). Import validates authorisations with every E4 rule and rejects (422, unchanged) any state where a user's effectively-open holds exceed their balance or a balance is negative.
