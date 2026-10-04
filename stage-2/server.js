@@ -1,5 +1,6 @@
 'use strict';
-// Pocketful stage 1 — payments, requests, splits, settlements.
+// Pocketful stage 2 — stage 1 (payments, requests, splits, settlements) plus
+// payment authorisations (holds) with captures, voids and clock-driven expiry.
 // Single process, in-memory state. Every check+mutation runs synchronously in
 // one event-loop tick, so the single JS thread linearises all operations.
 // The only async work is scrypt password hashing; state is re-checked after it.
@@ -13,6 +14,10 @@ const MAX_TEST_BODY = 256 << 20;   // test-control endpoints carry whole states
 const MAX_AMOUNT = 1000000000;
 const HANDLE_RE = /^[a-z0-9_]{1,20}$/;
 const SCRYPT = { N: 2048, r: 8, p: 1, keylen: 32 };
+const DEFAULT_TTL = 600;
+const MAX_DATE_MS = 253402300799999; // 9999-12-31T23:59:59.999Z, last RFC 3339 instant
+const RFC3339_RE = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+const AUTH_STATUSES = ['open', 'captured', 'voided', 'expired'];
 
 // ---------- errors ----------
 class ApiError extends Error {
@@ -44,12 +49,15 @@ function canon(v) {
 }
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
+// Monotone server clock: every timestamp and every expiry decision uses it.
 let lastMs = 0;
-function nowIso() {
-  const ms = Math.max(Date.now(), lastMs);
-  lastMs = ms;
-  return new Date(ms).toISOString().replace('Z', '+00:00');
+function clockMs() {
+  lastMs = Math.max(Date.now(), lastMs);
+  return lastMs;
 }
+const isoOf = (ms) => new Date(Math.min(ms, MAX_DATE_MS)).toISOString().replace('Z', '+00:00');
+const nowIso = () => isoOf(clockMs());
+const rfc3339Ms = (v) => (typeof v === 'string' && RFC3339_RE.test(v) ? Date.parse(v) : NaN);
 
 function hashPassword(password, N = SCRYPT.N) {
   const salt = crypto.randomBytes(16);
@@ -77,6 +85,7 @@ function emptyState(currency, minorUnits) {
     users: new Map(), byEmail: new Map(), byHandle: new Map(), tokens: new Map(),
     payments: [], requests: new Map(), // requests in insertion (creation) order
     operators: new Set(), idem: new Map(), used: new Set(), counter: 0,
+    auths: new Map(), ttl: DEFAULT_TTL, // authorisations in insertion order
   };
 }
 let state = emptyState('EUR', 2);
@@ -103,6 +112,37 @@ function insertUser(st, u) {
 
 const reqView = (r) => ({ ...r });
 
+// ---------- authorisations ----------
+// Stored status is open/captured/voided/expired; an open authorisation whose expires_at is at
+// or before now is effectively expired and holds nothing (derived at every read and write).
+const effStatus = (a, now) => (a.status === 'open' && a.expMs <= now ? 'expired' : a.status);
+const remainingOf = (a, now) => (effStatus(a, now) === 'open' ? a.amount - a.captured_amount : 0);
+function heldOf(st, uid, now) {
+  let h = 0;
+  for (const a of st.auths.values()) if (a.from_user_id === uid) h += remainingOf(a, now);
+  return h;
+}
+const availableOf = (st, u, now) => u.balance - heldOf(st, u.id, now);
+function authView(st, a, now) {
+  const f = st.users.get(a.from_user_id), t = st.users.get(a.to_user_id);
+  return {
+    authorization_id: a.id, from_user_id: f.id, from_handle: f.handle, to_user_id: t.id, to_handle: t.handle,
+    amount: a.amount, captured_amount: a.captured_amount, remaining_amount: remainingOf(a, now),
+    currency: st.currency, note: a.note, visibility: a.visibility, status: effStatus(a, now),
+    expires_at: a.expires_at, payment_id: a.payment_ids.length ? a.payment_ids[a.payment_ids.length - 1] : null,
+    payment_ids: [...a.payment_ids], created_at: a.created_at,
+  };
+}
+// Stored (exportable) form of an authorisation; expMs/createdMs are recomputed on load.
+const authRecord = (a) => ({
+  id: a.id, from_user_id: a.from_user_id, to_user_id: a.to_user_id, amount: a.amount,
+  captured_amount: a.captured_amount, payment_ids: [...a.payment_ids], note: a.note, visibility: a.visibility,
+  status: a.status, expires_at: a.expires_at, created_at: a.created_at,
+});
+function loadAuth(r) {
+  return { ...authRecord(r), expMs: rfc3339Ms(r.expires_at), createdMs: rfc3339Ms(r.created_at) };
+}
+
 // ---------- fixture (reset) ----------
 function checkStr(v, max) { return typeof v === 'string' && v.length > 0 && (max === undefined || v.length <= max); }
 
@@ -114,8 +154,15 @@ async function buildFromFixture(fx) {
   const payments = fx.payments == null ? [] : fx.payments;
   const requests = fx.requests == null ? [] : fx.requests;
   const operators = fx.settlement_operator_ids == null ? [] : fx.settlement_operator_ids;
-  if (!Array.isArray(payments) || !Array.isArray(requests) || !Array.isArray(operators)) throw invalid('collections');
+  const auths = fx.authorizations == null ? [] : fx.authorizations;
+  if (!Array.isArray(payments) || !Array.isArray(requests) || !Array.isArray(operators) || !Array.isArray(auths)) throw invalid('collections');
+  let ttl = DEFAULT_TTL;
+  if (fx.authorization_ttl_seconds !== undefined) {
+    ttl = fx.authorization_ttl_seconds;
+    if (typeof ttl !== 'number' || !Number.isSafeInteger(ttl) || ttl < 1) throw invalid('authorization_ttl_seconds must be a positive integer');
+  }
   const st = emptyState(fx.currency, fx.minor_units);
+  st.ttl = ttl;
   const ids = new Set(), emails = new Set(), handles = new Set();
   let total = 0;
   for (const u of fx.users) {
@@ -150,6 +197,49 @@ async function buildFromFixture(fx) {
     rids.add(r.id);
   }
   for (const o of operators) if (!ids.has(o)) throw invalid('settlement_operator_ids');
+  const tsMs = Date.parse(ts);
+  const aids = new Set();
+  const heldBy = new Map();
+  const seededAuths = auths.map((a) => {
+    if (!isObj(a) || !checkStr(a.id, 64) || aids.has(a.id)) throw invalid('authorization id');
+    if (!ids.has(a.from_user_id) || !ids.has(a.to_user_id) || a.from_user_id === a.to_user_id) throw invalid('authorization users');
+    if (!Number.isInteger(a.amount) || a.amount < 1 || a.amount > MAX_AMOUNT) throw invalid('authorization amount');
+    if (a.note !== undefined && (typeof a.note !== 'string' || cpLen(a.note) > 200)) throw invalid('authorization note');
+    if (a.visibility !== undefined && a.visibility !== 'public' && a.visibility !== 'private') throw invalid('authorization visibility');
+    const status = a.status === undefined ? 'open' : a.status;
+    if (!AUTH_STATUSES.includes(status)) throw invalid('authorization status');
+    const expMs = rfc3339Ms(a.expires_at);
+    if (Number.isNaN(expMs)) throw invalid('authorization expires_at');
+    let createdAt = ts;
+    if (a.created_at !== undefined) {
+      if (Number.isNaN(rfc3339Ms(a.created_at))) throw invalid('authorization created_at');
+      createdAt = a.created_at;
+    }
+    const captured = a.captured_amount === undefined ? (status === 'captured' ? a.amount : 0) : a.captured_amount;
+    if (!Number.isInteger(captured) || captured < 0 || captured > a.amount) throw invalid('authorization captured_amount');
+    let pidsOf = [];
+    if (a.payment_ids !== undefined) {
+      if (!Array.isArray(a.payment_ids) || a.payment_ids.some((x) => !checkStr(x, 64))) throw invalid('authorization payment_ids');
+      pidsOf = [...a.payment_ids];
+    }
+    if (a.payment_id !== undefined && a.payment_id !== null) {
+      if (!checkStr(a.payment_id, 64)) throw invalid('authorization payment_id');
+      if (pidsOf.length === 0) pidsOf = [a.payment_id];
+      else if (pidsOf[pidsOf.length - 1] !== a.payment_id) throw invalid('authorization payment_id');
+    }
+    aids.add(a.id);
+    const rec = loadAuth({
+      id: a.id, from_user_id: a.from_user_id, to_user_id: a.to_user_id, amount: a.amount, captured_amount: captured,
+      payment_ids: pidsOf, note: a.note === undefined ? '' : a.note, visibility: a.visibility === undefined ? 'public' : a.visibility,
+      status, expires_at: a.expires_at, created_at: createdAt,
+    });
+    const r = remainingOf(rec, tsMs);
+    if (r > 0) heldBy.set(a.from_user_id, (heldBy.get(a.from_user_id) || 0) + r);
+    return rec;
+  });
+  for (const u of fx.users) {
+    if ((heldBy.get(u.id) || 0) > u.balance) throw invalid('seeded open holds exceed the balance');
+  }
 
   // One salted scrypt per distinct seeded password (fixtures reuse passwords), so reset
   // time does not grow with the user count; users sharing a password share its record.
@@ -170,7 +260,7 @@ async function buildFromFixture(fx) {
       payment_id: p.id, from_user_id: from.id, from_handle: from.handle, to_user_id: to.id, to_handle: to.handle,
       amount: p.amount, currency: st.currency, note: p.note === undefined ? '' : p.note,
       visibility: p.visibility === undefined ? 'public' : p.visibility,
-      request_id: null, settlement_id: null, created_at: ts,
+      request_id: null, settlement_id: null, authorization_id: null, created_at: ts,
     });
   }
   for (const r of requests) {
@@ -183,6 +273,7 @@ async function buildFromFixture(fx) {
     });
   }
   for (const o of operators) st.operators.add(o);
+  for (const a of seededAuths) { st.used.add(a.id); st.auths.set(a.id, a); }
   return st;
 }
 
@@ -199,6 +290,8 @@ function exportState(st) {
       operators: [...st.operators],
       idempotency: [...st.idem.entries()],
       used_ids: [...st.used],
+      authorization_ttl_seconds: st.ttl,
+      authorizations: [...st.auths.values()].map(authRecord),
     }),
   };
 }
@@ -214,6 +307,13 @@ function importState(doc) {
   for (const k of ['users', 'tokens', 'payments', 'requests', 'operators', 'idempotency', 'used_ids']) need(Array.isArray(s[k]), k);
   const st = emptyState(s.currency, s.minor_units);
   st.counter = s.counter;
+  // A stage-1 export has neither field: no authorisations, default lifetime.
+  if (s.authorization_ttl_seconds !== undefined) {
+    need(Number.isSafeInteger(s.authorization_ttl_seconds) && s.authorization_ttl_seconds >= 1, 'authorization_ttl_seconds');
+    st.ttl = s.authorization_ttl_seconds;
+  }
+  const sAuths = s.authorizations === undefined ? [] : s.authorizations;
+  need(Array.isArray(sAuths), 'authorizations');
   const str = (v) => typeof v === 'string' && v.length > 0;
   for (const u of s.users) {
     need(isObj(u) && str(u.id) && u.id.length <= 64 && !st.users.has(u.id), 'user id');
@@ -243,12 +343,24 @@ function importState(doc) {
     need(Number.isInteger(p.amount) && p.amount >= 1 && p.amount <= MAX_AMOUNT, 'payment amount');
     need(p.currency === st.currency && note(p.note) && (p.visibility === 'public' || p.visibility === 'private'), 'payment fields');
     need((p.request_id === null || str(p.request_id)) && (p.settlement_id === null || str(p.settlement_id)) && ts(p.created_at), 'payment refs');
+    const authId = p.authorization_id === undefined ? null : p.authorization_id;
+    need(authId === null || str(authId), 'payment authorization_id');
     pids.add(p.payment_id);
     st.payments.push({
       payment_id: p.payment_id, from_user_id: p.from_user_id, from_handle: p.from_handle, to_user_id: p.to_user_id,
       to_handle: p.to_handle, amount: p.amount, currency: p.currency, note: p.note, visibility: p.visibility,
-      request_id: p.request_id, settlement_id: p.settlement_id, created_at: p.created_at,
+      request_id: p.request_id, settlement_id: p.settlement_id, authorization_id: authId, created_at: p.created_at,
     });
+  }
+  for (const a of sAuths) {
+    need(isObj(a) && str(a.id) && a.id.length <= 64 && !st.auths.has(a.id), 'authorization id');
+    need(st.users.has(a.from_user_id) && st.users.has(a.to_user_id) && a.from_user_id !== a.to_user_id, 'authorization users');
+    need(Number.isInteger(a.amount) && a.amount >= 1 && a.amount <= MAX_AMOUNT
+      && Number.isInteger(a.captured_amount) && a.captured_amount >= 0 && a.captured_amount <= a.amount, 'authorization amounts');
+    need(Array.isArray(a.payment_ids) && a.payment_ids.every((x) => typeof x === 'string'), 'authorization payment_ids');
+    need(note(a.note) && (a.visibility === 'public' || a.visibility === 'private') && AUTH_STATUSES.includes(a.status), 'authorization fields');
+    need(!Number.isNaN(rfc3339Ms(a.expires_at)) && !Number.isNaN(rfc3339Ms(a.created_at)), 'authorization times');
+    st.auths.set(a.id, loadAuth(a));
   }
   for (const r of s.requests) {
     need(isObj(r) && str(r.request_id) && !st.requests.has(r.request_id), 'request id');
@@ -271,6 +383,7 @@ function importState(doc) {
   for (const id of s.used_ids) { need(typeof id === 'string', 'used id'); st.used.add(id); }
   for (const id of pids) st.used.add(id);
   for (const id of st.requests.keys()) st.used.add(id);
+  for (const id of st.auths.keys()) st.used.add(id);
   return st;
 }
 
@@ -327,11 +440,11 @@ function userByHandleOr404(st, h) {
   return st.users.get(id);
 }
 
-function makePayment(st, from, to, amount, note, visibility, requestId, settlementId, ts) {
+function makePayment(st, from, to, amount, note, visibility, requestId, settlementId, ts, authorizationId = null) {
   const p = {
     payment_id: newId(st, 'p_'), from_user_id: from.id, from_handle: from.handle,
     to_user_id: to.id, to_handle: to.handle, amount, currency: st.currency, note, visibility,
-    request_id: requestId, settlement_id: settlementId, created_at: ts,
+    request_id: requestId, settlement_id: settlementId, authorization_id: authorizationId, created_at: ts,
   };
   from.balance -= amount;
   to.balance += amount;
@@ -358,8 +471,49 @@ const ops = {
     const visibility = checkVisibility(body);
     const to = userByHandleOr404(st, h);
     if (to.id === me.id) throw new ApiError(422, 'self_payment', 'cannot pay yourself');
-    if (me.balance < amount) throw new ApiError(409, 'insufficient_funds', 'insufficient funds');
-    return makePayment(st, me, to, amount, note, visibility, null, null, nowIso());
+    const now = clockMs();
+    if (availableOf(st, me, now) < amount) throw new ApiError(409, 'insufficient_funds', 'insufficient funds');
+    return makePayment(st, me, to, amount, note, visibility, null, null, isoOf(now));
+  },
+
+  authorize(st, me, body) {
+    typeStr(body, 'to_handle');
+    const h = reqHandle(body, 'to_handle');
+    const amount = checkAmount(body.amount, has(body, 'amount'));
+    const note = checkNote(body);
+    const visibility = checkVisibility(body);
+    const to = userByHandleOr404(st, h);
+    if (to.id === me.id) throw new ApiError(422, 'self_payment', 'cannot authorise a payment to yourself');
+    const now = clockMs();
+    if (availableOf(st, me, now) < amount) throw new ApiError(409, 'insufficient_funds', 'insufficient available funds');
+    const expMs = Math.min(now + st.ttl * 1000, MAX_DATE_MS);
+    const a = {
+      id: newId(st, 'a_'), from_user_id: me.id, to_user_id: to.id, amount, captured_amount: 0, payment_ids: [],
+      note, visibility, status: 'open', expires_at: isoOf(expMs), created_at: isoOf(now), expMs, createdMs: now,
+    };
+    st.auths.set(a.id, a);
+    return authView(st, a, now);
+  },
+
+  capture(st, me, body, authId) {
+    if (has(body, 'final') && typeof body.final !== 'boolean') throw bad('final must be a boolean');
+    const a = st.auths.get(authId);
+    if (!a) throw notFound('no such authorization');
+    if (a.to_user_id !== me.id) throw forbidden();
+    if (has(body, 'amount')) checkAmount(body.amount, true);
+    const now = clockMs();
+    if (a.status !== 'open') throw new ApiError(409, 'authorization_not_open', 'authorization is not open');
+    if (a.expMs <= now) throw new ApiError(409, 'authorization_expired', 'authorization has expired');
+    const remaining = a.amount - a.captured_amount;
+    const amount = has(body, 'amount') ? body.amount : remaining;
+    if (amount > remaining) throw new ApiError(422, 'capture_exceeds_authorization', 'capture exceeds the uncaptured remainder');
+    const final = has(body, 'final') ? body.final : true;
+    // The capture spends the payer's own hold, so available never goes negative.
+    const p = makePayment(st, st.users.get(a.from_user_id), me, amount, a.note, a.visibility, null, null, isoOf(now), a.id);
+    a.captured_amount += amount;
+    a.payment_ids.push(p.payment_id);
+    if (final || a.captured_amount === a.amount) a.status = 'captured';
+    return p;
   },
 
   requests(st, me, body) {
@@ -379,8 +533,9 @@ const ops = {
     const visibility = checkVisibility(body);
     if (r.status !== 'pending') throw new ApiError(409, 'request_not_pending', 'request is not pending');
     const to = st.users.get(r.requester_id);
-    if (me.balance < r.amount) throw new ApiError(409, 'insufficient_funds', 'insufficient funds');
-    const p = makePayment(st, me, to, r.amount, r.note, visibility, r.request_id, null, nowIso());
+    const now = clockMs();
+    if (availableOf(st, me, now) < r.amount) throw new ApiError(409, 'insufficient_funds', 'insufficient funds');
+    const p = makePayment(st, me, to, r.amount, r.note, visibility, r.request_id, null, isoOf(now));
     r.status = 'paid';
     r.payment_id = p.payment_id;
     return p;
@@ -429,17 +584,19 @@ const ops = {
       delta.set(x.from.id, (delta.get(x.from.id) || 0) - x.amount);
       delta.set(x.to.id, (delta.get(x.to.id) || 0) + x.amount);
     }
+    // Net debits are funded only by available funds: total + net - held >= 0 for every wallet.
+    const now = clockMs();
     for (const [uid, d] of delta) {
-      if (st.users.get(uid).balance + d < 0) throw new ApiError(409, 'insufficient_funds', 'settlement is not affordable');
+      if (availableOf(st, st.users.get(uid), now) + d < 0) throw new ApiError(409, 'insufficient_funds', 'settlement is not affordable');
     }
     // Apply credits/debits net per wallet so no balance is ever negative, then record payments.
-    const ts = nowIso();
+    const ts = isoOf(now);
     const sid = newId(st, 'st_');
     const payments = plan.map((x) => {
       const p = {
         payment_id: newId(st, 'p_'), from_user_id: x.from.id, from_handle: x.from.handle,
         to_user_id: x.to.id, to_handle: x.to.handle, amount: x.amount, currency: st.currency,
-        note: x.note, visibility: x.visibility, request_id: null, settlement_id: sid, created_at: ts,
+        note: x.note, visibility: x.visibility, request_id: null, settlement_id: sid, authorization_id: null, created_at: ts,
       };
       st.payments.push(p);
       return p;
@@ -514,6 +671,17 @@ function decideRequest(st, me, id, action) {
   return reqView(r);
 }
 
+function voidAuthorization(st, me, id) {
+  const a = st.auths.get(id);
+  if (!a) throw notFound('no such authorization');
+  if (a.from_user_id !== me.id) throw forbidden();
+  const now = clockMs();
+  if (a.status === 'voided') return authView(st, a, now);
+  if (effStatus(a, now) !== 'open') throw new ApiError(409, 'authorization_not_open', 'authorization is not open');
+  a.status = 'voided';
+  return authView(st, a, now);
+}
+
 async function signup(req, res, raw) {
   const body = parseObjBody(raw);
   for (const k of ['email', 'password', 'display_name']) typeStr(body, k);
@@ -570,8 +738,9 @@ const ROUTES = [
   ['POST', /^\/auth\/login$/, login],
   ['GET', /^\/me$/, (req, res) => {
     const st = state, me = authenticate(st, req);
+    const held = heldOf(st, me.id, clockMs());
     send(res, 200, { user_id: me.id, display_name: me.display_name, handle: me.handle, balance: me.balance,
-      currency: st.currency, minor_units: st.minorUnits });
+      total: me.balance, available: me.balance - held, held, currency: st.currency, minor_units: st.minorUnits });
   }],
   ['POST', /^\/payments$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'payments', {})],
   ['POST', /^\/requests$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'requests', {})],
@@ -611,6 +780,34 @@ const ROUTES = [
     }
     const p = page(items, pg);
     send(res, 200, { payments: p.items, has_more: p.has_more });
+  }],
+  ['POST', /^\/authorizations$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'authorize', {})],
+  ['GET', /^\/authorizations$/, (req, res, raw, m, path, q) => {
+    const st = state, me = authenticate(st, req);
+    const dir = q.has('direction') ? q.get('direction') : null;
+    if (dir !== null && dir !== 'incoming' && dir !== 'outgoing') throw invalid('direction must be incoming or outgoing');
+    const status = q.has('status') ? q.get('status') : null;
+    if (status !== null && !AUTH_STATUSES.includes(status)) throw invalid('unknown status');
+    const pg = pageParams(q);
+    const now = clockMs();
+    const items = [];
+    let i = 0;
+    for (const a of st.auths.values()) {
+      i++;
+      const mine = dir === 'outgoing' ? a.from_user_id === me.id
+        : dir === 'incoming' ? a.to_user_id === me.id
+          : a.from_user_id === me.id || a.to_user_id === me.id;
+      if (mine && (status === null || effStatus(a, now) === status)) items.push([a, i]);
+    }
+    items.sort((x, y) => (y[0].createdMs - x[0].createdMs) || (y[1] - x[1]));
+    const p = page(items, pg);
+    send(res, 200, { authorizations: p.items.map(([a]) => authView(st, a, now)), has_more: p.has_more });
+  }],
+  ['POST', /^\/authorizations\/([^/]+)\/capture$/, (req, res, raw, m, path) =>
+    idempotent(req, res, raw, path, 'capture', { emptyAs: {}, arg: m[1] })],
+  ['POST', /^\/authorizations\/([^/]+)\/void$/, (req, res, raw, m) => {
+    const st = state, me = authenticate(st, req);
+    send(res, 200, voidAuthorization(st, me, m[1]));
   }],
   ['POST', /^\/settlements$/, (req, res, raw, m, path) =>
     idempotent(req, res, raw, path, 'settlements', { operatorOnly: true })],
@@ -676,4 +873,4 @@ server.on('clientError', (err, socket) => {
     socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
   } else socket.destroy();
 });
-server.listen(PORT, '0.0.0.0', () => console.log(`pocketful stage 1 listening on 0.0.0.0:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`pocketful stage 2 listening on 0.0.0.0:${PORT}`));
