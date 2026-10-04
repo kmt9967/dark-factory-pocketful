@@ -51,12 +51,12 @@ function nowIso() {
   return new Date(ms).toISOString().replace('Z', '+00:00');
 }
 
-function hashPassword(password) {
+function hashPassword(password, N = SCRYPT.N) {
   const salt = crypto.randomBytes(16);
   return new Promise((resolve, reject) => {
-    crypto.scrypt(password, salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p }, (err, key) => {
+    crypto.scrypt(password, salt, SCRYPT.keylen, { N, r: SCRYPT.r, p: SCRYPT.p }, (err, key) => {
       if (err) reject(err);
-      else resolve({ alg: 'scrypt', N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, salt: salt.toString('hex'), hash: key.toString('hex') });
+      else resolve({ alg: 'scrypt', N, r: SCRYPT.r, p: SCRYPT.p, salt: salt.toString('hex'), hash: key.toString('hex') });
     });
   });
 }
@@ -151,9 +151,15 @@ async function buildFromFixture(fx) {
   }
   for (const o of operators) if (!ids.has(o)) throw invalid('settlement_operator_ids');
 
-  const hashes = await Promise.all(fx.users.map((u) => hashPassword(u.password)));
-  fx.users.forEach((u, i) => insertUser(st, {
-    id: u.id, email: u.email, pwd: hashes[i],
+  // One salted scrypt per distinct seeded password (fixtures reuse passwords), so reset
+  // time does not grow with the user count; users sharing a password share its record.
+  // With very many distinct passwords the scrypt cost steps down (still a salted KDF) so a
+  // reset stays well inside its 10 s budget on 2 vCPU; the cost is stored per hash.
+  const distinct = [...new Set(fx.users.map((u) => u.password))];
+  const N = distinct.length <= 256 ? SCRYPT.N : distinct.length <= 1024 ? SCRYPT.N / 2 : SCRYPT.N / 4;
+  const hashed = new Map(await Promise.all(distinct.map(async (pw) => [pw, await hashPassword(pw, N)])));
+  fx.users.forEach((u) => insertUser(st, {
+    id: u.id, email: u.email, pwd: { ...hashed.get(u.password) },
     display_name: u.display_name === undefined ? u.handle : u.display_name,
     handle: u.handle, balance: u.balance,
   }));
@@ -282,7 +288,6 @@ function typeStr(body, k) {
 }
 function reqHandle(body, k) {
   if (!has(body, k)) throw invalid(`${k} is required`);
-  if (!HANDLE_RE.test(body[k])) throw invalid(`${k} is not a valid handle`);
   return body[k];
 }
 function checkAmount(v, present) {
@@ -391,7 +396,6 @@ const ops = {
     const handles = body.participant_handles;
     if (handles.length === 0) throw invalid('participant_handles must not be empty');
     if (new Set(handles).size !== handles.length) throw invalid('participant_handles contains a duplicate');
-    if (handles.some((x) => !HANDLE_RE.test(x))) throw invalid('participant handle is not valid');
     const note = checkNote(body);
     const users = handles.map((h) => userByHandleOr404(st, h));
     const n = users.length, base = Math.floor(amount / n), rem = amount - base * n;
@@ -408,10 +412,10 @@ const ops = {
   settlements(st, me, body) {
     const tr = body.transfers;
     if (!Array.isArray(tr) || tr.length < 1 || tr.length > 32) throw invalid('transfers must be an array of 1 to 32 items');
-    if (tr.some((t) => !isObj(t))) throw invalid('every transfer must be an object');
+    // Entries are checked one at a time in input order: the first bad entry decides the error.
     const plan = tr.map((t) => {
+      if (!isObj(t)) throw invalid('every transfer must be an object');
       if (typeof t.from_handle !== 'string' || typeof t.to_handle !== 'string') throw invalid('transfer handles must be strings');
-      if (!HANDLE_RE.test(t.from_handle) || !HANDLE_RE.test(t.to_handle)) throw invalid('transfer handle is not valid');
       const amount = checkAmount(t.amount, has(t, 'amount'));
       const note = checkNote(t);
       const visibility = checkVisibility(t);
@@ -513,12 +517,13 @@ function decideRequest(st, me, id, action) {
 async function signup(req, res, raw) {
   const body = parseObjBody(raw);
   for (const k of ['email', 'password', 'display_name']) typeStr(body, k);
-  for (const k of ['email', 'password', 'display_name']) if (!has(body, k)) throw invalid(`${k} is required`);
-  const { email, password, display_name } = body;
+  for (const k of ['email', 'password']) if (!has(body, k)) throw invalid(`${k} is required`);
+  const { email, password } = body;
   if (!isEmail(email)) throw invalid('email must be of the form local@domain');
   if (cpLen(password) < 8) throw invalid('password must be at least 8 characters');
-  if (display_name.length === 0) throw invalid('display_name must not be empty');
   const handle = deriveHandle(email);
+  // display_name is optional (no rule in §6): defaults to the derived handle, stored verbatim.
+  const display_name = has(body, 'display_name') ? body.display_name : handle;
   const conflicts = (st) => {
     if (st.byEmail.has(email.toLowerCase())) throw new ApiError(409, 'email_taken', 'email already registered');
     if (!HANDLE_RE.test(handle)) throw invalid('cannot derive a handle from this email');

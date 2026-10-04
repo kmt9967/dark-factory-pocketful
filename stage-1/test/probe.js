@@ -356,6 +356,76 @@ test('routing, 405, 413, reset perf', async () => {
   console.log(`    reset(200 users)=${dt}ms, 50 concurrent logins=${Date.now() - t1}ms`);
 });
 
+test('D11: malformed or unknown handle strings are 404 at every site, D2 order kept', async () => {
+  await reset(FX({ settlement_operator_ids: ['u_cy'] }));
+  const ada = await login('ada'), cy = await login('cy');
+  for (const h of ['BOB', 'no-such', '', 'x'.repeat(30), 'zed']) {
+    err(await call('POST', '/payments', { token: ada, key: k(), body: { to_handle: h, amount: 1 } }), 404, 'not_found');
+    err(await call('POST', '/requests', { token: ada, key: k(), body: { payer_handle: h, amount: 1 } }), 404, 'not_found');
+    err(await call('POST', '/splits', { token: ada, key: k(), body: { amount: 3, participant_handles: ['bob', h] } }), 404, 'not_found');
+    err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [{ from_handle: h, to_handle: 'bob', amount: 1 }] } }), 404, 'not_found');
+    err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [{ from_handle: 'ada', to_handle: h, amount: 1 }] } }), 404, 'not_found');
+  }
+  // field validation still precedes the lookup
+  err(await call('POST', '/payments', { token: ada, key: k(), body: { to_handle: 'BOB', amount: 0 } }), 422, 'validation_failed');
+  err(await call('POST', '/payments', { token: ada, key: k(), body: { to_handle: 'BOB', amount: 1, visibility: 'x' } }), 422, 'validation_failed');
+  err(await call('POST', '/requests', { token: ada, key: k(), body: { payer_handle: 'BOB', amount: 1, note: null } }), 422, 'validation_failed');
+  err(await call('POST', '/splits', { token: ada, key: k(), body: { amount: 3, participant_handles: ['BOB', 'BOB'] } }), 422, 'validation_failed');
+  err(await call('POST', '/splits', { token: ada, key: k(), body: { amount: 3, participant_handles: [] } }), 422, 'validation_failed');
+  err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [{ from_handle: 'BOB', to_handle: 'bob', amount: 0 }] } }), 422, 'validation_failed');
+  // wrong JSON type stays 400 (fields) / 422 (settlement entry)
+  err(await call('POST', '/payments', { token: ada, key: k(), body: { to_handle: null, amount: 1 } }), 400, 'malformed_request');
+  err(await call('POST', '/splits', { token: ada, key: k(), body: { amount: 3, participant_handles: ['bob', 7] } }), 400, 'malformed_request');
+  err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [{ from_handle: 5, to_handle: 'bob', amount: 1 }] } }), 422, 'validation_failed');
+});
+
+test('F3: settlement entry errors in input order, non-object entries included', async () => {
+  await reset(FX({ settlement_operator_ids: ['u_cy'] }));
+  const cy = await login('cy');
+  err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [{ from_handle: 'zz', to_handle: 'bob', amount: 1 }, 5] } }), 404, 'not_found');
+  err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [5, { from_handle: 'zz', to_handle: 'bob', amount: 1 }] } }), 422, 'validation_failed');
+  err(await call('POST', '/settlements', { token: cy, key: k(), body: { transfers: [{ from_handle: 'ada', to_handle: 'ada', amount: 1 }, null] } }), 422, 'self_payment');
+});
+
+test('F2: 1000-user reset with a shared password stays fast; seeded logins work', async () => {
+  const users = Array.from({ length: 1000 }, (_, i) => U(`v${i}`, 5));
+  users[3] = U('v3', 5, { password: 'another secret' });
+  const t0 = Date.now();
+  await reset({ currency: 'JPY', minor_units: 0, users });
+  const dt = Date.now() - t0;
+  assert.ok(dt < 3000, `reset took ${dt}ms`);
+  assert.equal((await call('POST', '/auth/login', { body: { email: 'v999@example.com', password: 'correct horse' } })).status, 200);
+  assert.equal((await call('POST', '/auth/login', { body: { email: 'v3@example.com', password: 'another secret' } })).status, 200);
+  assert.equal((await call('POST', '/auth/login', { body: { email: 'v3@example.com', password: 'correct horse' } })).status, 401);
+  const ex = await call('GET', '/_test/export');
+  assert.ok(!JSON.stringify(ex.body).includes('correct horse'));
+  console.log(`    reset(1000 users)=${dt}ms`);
+});
+
+test('F4: signup display_name optional, defaults to derived handle; non-string 400; empty kept', async () => {
+  await world();
+  const a = await call('POST', '/auth/signup', { body: { email: 'No.Name@example.com', password: 'longenough' } });
+  assert.equal(a.status, 201, JSON.stringify(a.body)); assert.equal(a.body.display_name, 'no_name');
+  assert.equal((await call('GET', '/me', { token: a.body.token })).body.display_name, 'no_name');
+  const b = await call('POST', '/auth/signup', { body: { email: 'empty@example.com', password: 'longenough', display_name: '' } });
+  assert.equal(b.status, 201); assert.equal(b.body.display_name, '');
+  const v = await call('POST', '/auth/signup', { body: { email: 'verb@example.com', password: 'longenough', display_name: '  Zoë 😀 ' } });
+  assert.equal(v.body.display_name, '  Zoë 😀 ');
+  err(await call('POST', '/auth/signup', { body: { email: 'n1@example.com', password: 'longenough', display_name: null } }), 400, 'malformed_request');
+  err(await call('POST', '/auth/signup', { body: { email: 'n2@example.com', password: 'longenough', display_name: 5 } }), 400, 'malformed_request');
+});
+
+test('F2: 2000-user reset with all-distinct passwords stays well under 10 s', async () => {
+  const users = Array.from({ length: 2000 }, (_, i) => U(`w${i}`, 1, { password: `secret-${i}` }));
+  const t0 = Date.now();
+  await reset({ currency: 'BHD', minor_units: 3, users });
+  const dt = Date.now() - t0;
+  assert.ok(dt < 8000, `reset took ${dt}ms`);
+  assert.equal((await call('POST', '/auth/login', { body: { email: 'w1999@example.com', password: 'secret-1999' } })).status, 200);
+  assert.equal((await call('POST', '/auth/login', { body: { email: 'w1999@example.com', password: 'secret-1998' } })).status, 401);
+  console.log(`    reset(2000 distinct passwords)=${dt}ms`);
+});
+
 (async () => {
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'inherit'] });
   for (let i = 0; i < 100; i++) {
