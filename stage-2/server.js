@@ -7,6 +7,8 @@
 
 const http = require('node:http');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const nodePath = require('node:path');
 
 const PORT = parseInt(process.env.PORT || '8080', 10) || 8080;
 const MAX_BODY = 1 << 20;          // 1 MiB for API requests
@@ -727,8 +729,46 @@ async function login(req, res, raw) {
   send(res, 200, { user_id: user.id, display_name: user.display_name, token: issueToken(st, user.id) });
 }
 
+// ---------- web UI ----------
+// The UI is a client-rendered app served by this process; every asset is inside the image.
+const ASSET_TYPES = { '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+const ASSETS = new Map(['app.js', 'app.css'].map((f) =>
+  [f, { body: fs.readFileSync(nodePath.join(__dirname, 'public', f)), type: ASSET_TYPES[nodePath.extname(f)] }]));
+const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%230e6b59'/%3E%3Ctext x='16' y='22' font-family='Arial' font-size='18' font-weight='700' fill='white' text-anchor='middle'%3EP%3C/text%3E%3C/svg%3E";
+const SHELL = Buffer.from(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0e6b59">
+<title>Pocketful</title>
+<link rel="icon" href="${FAVICON}">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="app"><p style="padding:24px;font-family:system-ui,sans-serif;color:#5a6a65">Loading Pocketful…</p></div>
+<noscript>Pocketful needs JavaScript to run in your browser.</noscript>
+<script src="/assets/app.js"></script>
+</body>
+</html>
+`, 'utf8');
+function sendHtml(res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': SHELL.length, 'Cache-Control': 'no-cache' });
+  res.end(SHELL);
+}
+const wantsHtml = (req) => /text\/html/i.test(String(req.headers.accept || ''));
+// Shared routes (/requests, /authorizations): Accept: text/html gets the UI, anything else the API.
+const negotiated = (api) => (req, res, ...rest) => (wantsHtml(req) ? sendHtml(res) : api(req, res, ...rest));
+
 const ROUTES = [
   ['GET', /^\/health$/, (req, res) => send(res, 200, { status: 'ok' })],
+  ['GET', /^\/(?:split|signup|login)?$/, (req, res) => sendHtml(res)],
+  ['GET', /^\/assets\/([a-z.]+)$/, (req, res, raw, m) => {
+    const a = ASSETS.get(m[1]);
+    if (!a) throw notFound('no such asset');
+    res.writeHead(200, { 'Content-Type': a.type, 'Content-Length': a.body.length, 'Cache-Control': 'no-cache' });
+    res.end(a.body);
+  }],
   ['POST', /^\/_test\/reset$/, async (req, res, raw) => {
     const fx = parseObjBody(raw);
     state = await buildFromFixture(fx);
@@ -750,7 +790,7 @@ const ROUTES = [
   }],
   ['POST', /^\/payments$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'payments', {})],
   ['POST', /^\/requests$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'requests', {})],
-  ['GET', /^\/requests$/, (req, res, raw, m, path, q) => {
+  ['GET', /^\/requests$/, negotiated((req, res, raw, m, path, q) => {
     const st = state, me = authenticate(st, req);
     const dir = q.has('direction') ? q.get('direction') : null;
     if (dir !== null && dir !== 'incoming' && dir !== 'outgoing') throw invalid('direction must be incoming or outgoing');
@@ -768,7 +808,7 @@ const ROUTES = [
     }
     const p = page(items, pg);
     send(res, 200, { requests: p.items.map(reqView), has_more: p.has_more });
-  }],
+  })],
   ['POST', /^\/requests\/([^/]+)\/pay$/, (req, res, raw, m, path) =>
     idempotent(req, res, raw, path, 'pay', { emptyAs: {}, arg: m[1] })],
   ['POST', /^\/requests\/([^/]+)\/(decline|cancel)$/, (req, res, raw, m) => {
@@ -788,7 +828,7 @@ const ROUTES = [
     send(res, 200, { payments: p.items, has_more: p.has_more });
   }],
   ['POST', /^\/authorizations$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'authorize', {})],
-  ['GET', /^\/authorizations$/, (req, res, raw, m, path, q) => {
+  ['GET', /^\/authorizations$/, negotiated((req, res, raw, m, path, q) => {
     const st = state, me = authenticate(st, req);
     const dir = q.has('direction') ? q.get('direction') : null;
     if (dir !== null && dir !== 'incoming' && dir !== 'outgoing') throw invalid('direction must be incoming or outgoing');
@@ -808,7 +848,7 @@ const ROUTES = [
     items.sort((x, y) => (y[0].createdMs - x[0].createdMs) || (y[1] - x[1]));
     const p = page(items, pg);
     send(res, 200, { authorizations: p.items.map(([a]) => authView(st, a, now)), has_more: p.has_more });
-  }],
+  })],
   ['POST', /^\/authorizations\/([^/]+)\/capture$/, (req, res, raw, m, path) =>
     idempotent(req, res, raw, path, 'capture', { emptyAs: {}, arg: m[1] })],
   ['POST', /^\/authorizations\/([^/]+)\/void$/, (req, res, raw, m) => {
