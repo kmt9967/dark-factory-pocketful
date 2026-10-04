@@ -217,6 +217,7 @@ async function buildFromFixture(fx) {
     }
     const captured = a.captured_amount === undefined ? (status === 'captured' ? a.amount : 0) : a.captured_amount;
     if (!Number.isInteger(captured) || captured < 0 || captured > a.amount) throw invalid('authorization captured_amount');
+    if (status === 'open' && captured >= a.amount) throw invalid('an open authorization must have an uncaptured remainder');
     let pidsOf = [];
     if (a.payment_ids !== undefined) {
       if (!Array.isArray(a.payment_ids) || a.payment_ids.some((x) => !checkStr(x, 64))) throw invalid('authorization payment_ids');
@@ -357,11 +358,15 @@ function importState(doc) {
     need(st.users.has(a.from_user_id) && st.users.has(a.to_user_id) && a.from_user_id !== a.to_user_id, 'authorization users');
     need(Number.isInteger(a.amount) && a.amount >= 1 && a.amount <= MAX_AMOUNT
       && Number.isInteger(a.captured_amount) && a.captured_amount >= 0 && a.captured_amount <= a.amount, 'authorization amounts');
-    need(Array.isArray(a.payment_ids) && a.payment_ids.every((x) => typeof x === 'string'), 'authorization payment_ids');
-    need(note(a.note) && (a.visibility === 'public' || a.visibility === 'private') && AUTH_STATUSES.includes(a.status), 'authorization fields');
+    need(Array.isArray(a.payment_ids) && a.payment_ids.every((x) => checkStr(x, 64)), 'authorization payment_ids');
+    need(note(a.note) && cpLen(a.note) <= 200 && (a.visibility === 'public' || a.visibility === 'private') && AUTH_STATUSES.includes(a.status), 'authorization fields');
     need(!Number.isNaN(rfc3339Ms(a.expires_at)) && !Number.isNaN(rfc3339Ms(a.created_at)), 'authorization times');
+    need(a.status !== 'open' || a.captured_amount < a.amount, 'open authorization without remainder');
     st.auths.set(a.id, loadAuth(a));
   }
+  // available = total - held must not be negative for any user in the imported state.
+  const importNow = clockMs();
+  for (const u of st.users.values()) need(heldOf(st, u.id, importNow) <= u.balance, 'open holds exceed a balance');
   for (const r of s.requests) {
     need(isObj(r) && str(r.request_id) && !st.requests.has(r.request_id), 'request id');
     const a = st.users.get(r.requester_id), b = st.users.get(r.payer_id);
@@ -505,6 +510,7 @@ const ops = {
     if (a.status !== 'open') throw new ApiError(409, 'authorization_not_open', 'authorization is not open');
     if (a.expMs <= now) throw new ApiError(409, 'authorization_expired', 'authorization has expired');
     const remaining = a.amount - a.captured_amount;
+    if (remaining < 1) throw new ApiError(409, 'authorization_not_open', 'nothing remains to capture');
     const amount = has(body, 'amount') ? body.amount : remaining;
     if (amount > remaining) throw new ApiError(422, 'capture_exceeds_authorization', 'capture exceeds the uncaptured remainder');
     const final = has(body, 'final') ? body.final : true;

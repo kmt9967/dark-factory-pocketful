@@ -414,6 +414,56 @@ test('upgrade: stage-1 export imports into stage-2 (tokens, retries, pending req
   assert.equal((await call('POST', '/auth/login', { body: { email: 'bob@example.com', password: 'correct horse' } })).status, 200);
 });
 
+test('W2a F1: open hold with nothing remaining is rejected (fixture and import), never a 0 payment', async () => {
+  const fx = { currency: 'EUR', minor_units: 2, users: [U('ada', 100), U('bob', 0)] };
+  await reset(fx);
+  const ada = await login('ada');
+  const before = await me(ada);
+  for (const captured of [50, 60]) {
+    err(await call('POST', '/_test/reset', { body: { ...fx, authorizations: [{ id: 'a1', from_user_id: 'u_ada', to_user_id: 'u_bob',
+      amount: 50, status: 'open', captured_amount: captured, expires_at: isoIn(7200) }] } }), 422, 'validation_failed');
+  }
+  assert.deepEqual(await me(ada), before); // unchanged, old token valid
+  // captured with captured_amount == amount is still fine
+  await reset({ ...fx, authorizations: [{ id: 'a1', from_user_id: 'u_ada', to_user_id: 'u_bob', amount: 50, status: 'captured', captured_amount: 50, expires_at: isoIn(7200) }] });
+  const ex = (await call('GET', '/_test/export')).body;
+  const bad = JSON.parse(JSON.stringify(ex));
+  bad.state.authorizations[0].status = 'open';
+  err(await call('POST', '/_test/import', { body: bad }), 422, 'validation_failed');
+  const bob = await login('bob');
+  err(await capture(bob, 'a1', {}), 409, 'authorization_not_open');
+  assert.equal((await call('GET', '/activity', { token: bob })).body.payments.length, 0);
+});
+
+test('W2a F2: import rejects open holds above a balance, destination unchanged', async () => {
+  await reset({ currency: 'EUR', minor_units: 2, users: [U('ada', 100), U('bob', 0)] });
+  const ada = await login('ada');
+  const ex = (await call('GET', '/_test/export')).body;
+  const mk = (amount, exp) => ({ id: 'a9', from_user_id: 'u_ada', to_user_id: 'u_bob', amount, captured_amount: 0, payment_ids: [],
+    note: '', visibility: 'public', status: 'open', expires_at: exp, created_at: isoIn(0) });
+  const bad = JSON.parse(JSON.stringify(ex)); bad.state.authorizations = [mk(5000, isoIn(7200))];
+  err(await call('POST', '/_test/import', { body: bad }), 422, 'validation_failed');
+  let m = await me(ada);
+  assert.deepEqual([m.total, m.available, m.held], [100, 100, 0]);
+  const two = JSON.parse(JSON.stringify(ex));
+  two.state.authorizations = [mk(60, isoIn(7200)), { ...mk(41, isoIn(7200)), id: 'a10' }];
+  err(await call('POST', '/_test/import', { body: two }), 422, 'validation_failed');
+  // other E4 field rules apply to imported authorisations too
+  for (const patch of [{ note: 'x'.repeat(201) }, { payment_ids: [''] }, { payment_ids: ['p'.repeat(65)] }, { expires_at: '2099-01-01T00:00:00' },
+    { amount: 0 }, { captured_amount: -1 }, { status: 'weird' }, { visibility: 'friends' }, { to_user_id: 'u_ada' }]) {
+    const b = JSON.parse(JSON.stringify(ex)); b.state.authorizations = [{ ...mk(10, isoIn(7200)), ...patch }];
+    err(await call('POST', '/_test/import', { body: b }), 422, 'validation_failed');
+  }
+  const neg = JSON.parse(JSON.stringify(ex)); neg.state.users[0].balance = -1;
+  err(await call('POST', '/_test/import', { body: neg }), 422, 'validation_failed');
+  // an expired hold above the balance holds nothing, and exactly the balance is allowed
+  const ok = JSON.parse(JSON.stringify(ex));
+  ok.state.authorizations = [mk(5000, isoIn(-7200)), { ...mk(100, isoIn(7200)), id: 'a10' }];
+  assert.equal((await call('POST', '/_test/import', { body: ok })).status, 204);
+  m = await me(ada);
+  assert.deepEqual([m.total, m.available, m.held], [100, 0, 100]);
+});
+
 (async () => {
   const kids = [];
   const up = async (base, file) => {
