@@ -151,3 +151,6 @@ Stage 1 is one coherent service (~1 k lines); splitting it would leave unreviewa
 ## Amendments
 
 - D11 (after W1 rev 2bd7c4b): a handle field that is a string but matches no user — including one that does not fit `^[a-z0-9_]{1,20}$` (e.g. `"BOB"`, `"no-such"`) — is 404 `not_found` ("No user has that handle"), not 422. Applies to `to_handle`, `payer_handle`, `participant_handles` entries and settlement `from_handle`/`to_handle`. An empty string is also 404 (no user has it).
+- D12 (review of 2bd7c4b, F2): reset must stay well under 10 s for large fixtures (≥1000 users). Hash each distinct seeded password once per reset with a fresh salt and share that salted scrypt hash among users with that password; real KDF, never plaintext.
+- D13 (F3, refines D4): settlements check `transfers` is an array with 1..32 items first; then entries are checked strictly in input order, each entry getting its own not-an-object / type / field / 404 / self checks, so an earlier entry's error wins over a later entry's shape error.
+- D14 (F4, refines D5): `display_name` is optional on signup (§6 lists no rule); when omitted it defaults to the derived handle; when present it must be a string (else 400) and is stored verbatim (empty allowed).
