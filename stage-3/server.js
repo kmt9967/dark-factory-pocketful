@@ -52,14 +52,17 @@ function canon(v) {
 }
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
-// Strictly increasing server clock (ms): every call returns a later instant than the one before,
-// so each server-assigned time (created_at, recorded_at, event times, "read began") is unique and
-// a read always sorts after every earlier write.
+// Server clock (ms). Writes take strictly increasing instants (bumped by 1 ms when the wall clock
+// has not advanced), so every server-assigned event time (created_at, recorded_at, committed_at,
+// capture/void times) is unique per write and ordered. Reads take the current instant without
+// consuming a tick (readMs): it is never before any earlier write, and reads never push the clock
+// ahead of wall time.
 let lastMs = 0;
 function clockMs() {
   lastMs = Math.max(Date.now(), lastMs + 1);
   return lastMs;
 }
+const readMs = () => Math.max(Date.now(), lastMs);
 const isoOf = (ms) => new Date(Math.min(ms, MAX_DATE_MS)).toISOString().replace('Z', '+00:00');
 const nowIso = () => isoOf(clockMs());
 
@@ -126,7 +129,8 @@ function emptyState(currency, minorUnits) {
     operators: new Set(), idem: new Map(), used: new Set(), counter: 0,
     auths: new Map(), ttl: DEFAULT_TTL, // authorisations in insertion order
     revs: new Map(),      // payment id -> revisions [{revision, amount, effective_at, recorded_at, reason, effNs, recNs}]
-    snapshots: new Map(), // statement snapshot token -> frozen statement
+    snapshots: new Map(), // statement snapshot token -> frozen statement (entries as compact references)
+    payIndex: new Map(),  // payment id -> payment
   };
 }
 let state = emptyState('EUR', 2);
@@ -165,6 +169,7 @@ function revision(rev, amount, effectiveAt, recordedAt, reason) {
 const revView = (r) => ({ revision: r.revision, amount: r.amount, effective_at: r.effective_at, recorded_at: r.recorded_at, reason: r.reason });
 function recordOriginal(st, p) {
   st.revs.set(p.payment_id, [revision(1, p.amount, p.created_at, p.created_at, '')]);
+  st.payIndex.set(p.payment_id, p);
 }
 function selectRev(revs, K) {
   for (let i = revs.length - 1; i >= 0; i--) if (revs[i].recNs <= K) return revs[i];
@@ -404,13 +409,18 @@ async function buildFromFixture(fx) {
 }
 
 // ---------- export / import ----------
-// Clock high-water mark of a state: its latest stored instant. Deterministic, so re-exporting an
-// imported state reproduces it exactly; import raises the live clock to at least this value.
+// Clock high-water mark of a state: its latest stored event instant. Deterministic, so re-exporting
+// an imported state reproduces it exactly. Deadline-derived times (expires_at standing in as the
+// close time of an expired hold) are not events and never count.
 function stateClockMs(st) {
   let maxNs = 0n;
   const bump = (ns) => { if (ns !== null && ns > maxNs) maxNs = ns; };
   for (const revs of st.revs.values()) for (const r of revs) { bump(r.effNs); bump(r.recNs); }
-  for (const a of st.auths.values()) { bump(a.createdNs); bump(a.closedNs); for (const c of a.captures) bump(c.ns); }
+  for (const a of st.auths.values()) {
+    bump(a.createdNs);
+    if (!a.seededClosed && a.status !== 'expired') bump(a.closedNs);
+    for (const c of a.captures) bump(c.ns);
+  }
   for (const r of st.requests.values()) bump(parseInstant(r.created_at));
   return Math.min(ceilMs(maxNs), MAX_DATE_MS);
 }
@@ -431,7 +441,8 @@ function exportState(st) {
       ledger_version: 3,
       clock_ms: stateClockMs(st),
       revisions: [...st.revs.entries()].map(([pid, revs]) => [pid, revs.map(revView)]),
-      snapshots: [...st.snapshots.entries()],
+      snapshots: [...st.snapshots.entries()].map(([t, sn]) => [t, { owner: sn.owner, echo: sn.echo,
+        opening_balance: sn.opening_balance, closing_balance: sn.closing_balance, entries: snapshotRows(sn) }]),
     }),
   };
 }
@@ -504,6 +515,7 @@ function importState(doc) {
   st.payments = st.payments.map((p, i) => [p, parseInstant(p.created_at), i])
     .sort((x, y) => (x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : x[2] - y[2])).map((x) => x[0]);
   const payById = new Map(st.payments.map((p) => [p.payment_id, p]));
+  st.payIndex = payById;
   if (ledger) {
     for (const e of s.revisions) {
       need(Array.isArray(e) && e.length === 2 && payById.has(e[0]) && !st.revs.has(e[0]) && Array.isArray(e[1]) && e[1].length >= 1, 'revisions');
@@ -556,7 +568,7 @@ function importState(doc) {
     }
   }
   // available = total - held must not be negative for any user in the imported state.
-  const importNow = clockMs();
+  const importNow = readMs();
   for (const u of st.users.values()) need(heldOf(st, u.id, importNow) <= u.balance, 'open holds exceed a balance');
   for (const r of s.requests) {
     need(isObj(r) && str(r.request_id) && !st.requests.has(r.request_id), 'request id');
@@ -585,7 +597,11 @@ function importState(doc) {
       need(Array.isArray(e) && e.length === 2 && str(e[0]) && isObj(e[1]) && st.users.has(e[1].owner)
         && Number.isSafeInteger(e[1].opening_balance) && Number.isSafeInteger(e[1].closing_balance)
         && Array.isArray(e[1].entries) && isObj(e[1].echo), 'snapshot');
-      st.snapshots.set(e[0], e[1]);
+      for (const x of e[1].entries) {
+        need(Array.isArray(x) && x.length === 4 && payById.has(x[0]) && Number.isInteger(x[1]) && x[1] >= 1
+          && x[1] <= st.revs.get(x[0]).length && Number.isSafeInteger(x[2]) && Number.isSafeInteger(x[3]), 'snapshot entry');
+      }
+      st.snapshots.set(e[0], makeSnapshot(e[1].owner, e[1].echo, e[1].opening_balance, e[1].closing_balance, e[1].entries));
     }
   }
   // Raise the clock past every imported instant so new events sort after imported history.
@@ -887,7 +903,7 @@ function queryInstant(q, name) {
 function meAt(st, me, q) {
   const asOf = queryInstant(q, 'as_of');
   const knownAt = queryInstant(q, 'known_at');
-  const startMs = clockMs();
+  const startMs = readMs();
   if (!asOf && !knownAt) {
     const held = heldOf(st, me.id, startMs);
     return { user_id: me.id, display_name: me.display_name, handle: me.handle, balance: me.balance,
@@ -909,9 +925,28 @@ function newSnapshotToken(st) {
   do { t = 'ss_' + crypto.randomBytes(18).toString('hex'); } while (st.snapshots.has(t));
   return t;
 }
-function statementPage(token, snap, pg) {
-  const p = page(snap.entries, pg);
-  return { ...snap.echo, opening_balance: snap.opening_balance, entries: p.items,
+// Snapshots are stored column-wise: payment ids (shared string references) plus typed arrays of
+// revision numbers, deltas and balances. Payments and revisions are immutable, so rendering a page
+// later from these references always yields the frozen values.
+function makeSnapshot(owner, echo, opening, closing, rows) {
+  const n = rows.length;
+  const snap = { owner, echo, opening_balance: opening, closing_balance: closing, pids: new Array(n),
+    revNo: new Uint32Array(n), delta: new Float64Array(n), balance: new Float64Array(n) };
+  rows.forEach(([pid, rev, delta, bal], i) => { snap.pids[i] = pid; snap.revNo[i] = rev; snap.delta[i] = delta; snap.balance[i] = bal; });
+  return snap;
+}
+const snapshotRows = (snap) => snap.pids.map((pid, i) => [pid, snap.revNo[i], snap.delta[i], snap.balance[i]]);
+function statementPage(st, token, snap, pg) {
+  const n = snap.pids.length;
+  const end = Math.min(n, pg.offset + pg.limit);
+  const entries = [];
+  for (let i = pg.offset; i < end; i++) {
+    const pid = snap.pids[i], pay = st.payIndex.get(pid), r = st.revs.get(pid)[snap.revNo[i] - 1];
+    entries.push({ payment: { ...pay, amount: r.amount }, delta: snap.delta[i], balance_after: snap.balance[i],
+      revision: r.revision, effective_at: r.effective_at, recorded_at: r.recorded_at });
+  }
+  const p = { has_more: n > pg.offset + pg.limit };
+  return { ...snap.echo, opening_balance: snap.opening_balance, entries,
     closing_balance: snap.closing_balance, has_more: p.has_more, snapshot: token };
 }
 function statement(st, me, q) {
@@ -921,16 +956,17 @@ function statement(st, me, q) {
     const token = q.get('snapshot');
     const snap = st.snapshots.get(token);
     if (!snap || snap.owner !== me.id) throw notFound('no such statement snapshot');
-    return statementPage(token, snap, pg);
+    return statementPage(st, token, snap, pg);
   }
   const from = queryInstant(q, 'from');
   const to = queryInstant(q, 'to');
   const knownAt = queryInstant(q, 'known_at');
   const pg = pageParams(q);
   if (from && to && from.ns > to.ns) throw invalid('from must not be after to');
-  const start = nsOfMs(clockMs());
+  const start = nsOfMs(readMs());
   const K = knownAt ? knownAt.ns : start;
-  const toNs = to ? to.ns : start;
+  // Default `to` is the read instant itself, inclusive: every write before this read is in the window.
+  const toNs = to ? to.ns : start + 1n;
   // Every payment of the caller with a revision known at K, placed at its selected effective time.
   const rows = [];
   for (const p of st.payments) {
@@ -947,17 +983,16 @@ function statement(st, me, q) {
   for (const x of rows) {
     if ((from && x.r.effNs < from.ns) || x.r.effNs >= toNs) continue;
     running += x.delta;
-    entries.push({ payment: { ...x.p, amount: x.r.amount }, delta: x.delta, balance_after: running,
-      revision: x.r.revision, effective_at: x.r.effective_at, recorded_at: x.r.recorded_at });
+    entries.push([x.p.payment_id, x.r.revision, x.delta, running]);
   }
   const echo = {};
   if (from) echo.from = from.raw;
   if (to) echo.to = to.raw;
   if (knownAt) echo.known_at = knownAt.raw;
-  const snap = clone({ owner: me.id, echo, opening_balance: opening, closing_balance: running, entries });
+  const snap = makeSnapshot(me.id, echo, opening, running, entries);
   const token = newSnapshotToken(st);
   st.snapshots.set(token, snap);
-  return statementPage(token, snap, pg);
+  return statementPage(st, token, snap, pg);
 }
 
 function decideRequest(st, me, id, action) {
@@ -1073,7 +1108,8 @@ const ROUTES = [
   ['POST', /^\/_test\/import$/, (req, res, raw) => {
     const doc = parseObjBody(raw);
     const next = importState(doc);
-    lastMs = Math.max(lastMs, next.clockFloorMs || 0);
+    // Never past wall-clock now: imported data cannot drag the server clock into the future.
+    lastMs = Math.max(lastMs, Math.min(next.clockFloorMs || 0, Date.now()));
     state = next;
     send(res, 204);
   }],
@@ -1134,7 +1170,7 @@ const ROUTES = [
     const status = q.has('status') ? q.get('status') : null;
     if (status !== null && !AUTH_STATUSES.includes(status)) throw invalid('unknown status');
     const pg = pageParams(q);
-    const now = clockMs();
+    const now = readMs();
     const items = [];
     let i = 0;
     for (const a of st.auths.values()) {

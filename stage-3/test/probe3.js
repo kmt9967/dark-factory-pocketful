@@ -30,8 +30,15 @@ const U = (h, bal, extra = {}) => ({ id: `u_${h}`, email: `${h}@example.com`, pa
 const FX = (extra = {}) => ({ currency: 'EUR', minor_units: 2, users: [U('ada', 10000), U('bob', 2500), U('cy', 500)], ...extra });
 const isoMs = (ms) => new Date(ms).toISOString().replace('Z', '+00:00');
 const ms = (iso) => Date.parse(iso);
-// The instant 1 microsecond before a millisecond-precision instant.
-const minus1us = (iso) => { const d = isoMs(ms(iso) - 1); return d.replace(/\.(\d{3})\+/, '.$1999+'); };
+// Exact instant arithmetic in nanoseconds (UTC output with 9 fraction digits).
+const nsOf = (iso) => {
+  const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d+))?([Zz]|[+-]\d\d:\d\d)$/.exec(iso);
+  return BigInt(Date.parse(m[1] + m[3])) * 1000000n + BigInt(((m[2] || '') + '000000000').slice(0, 9));
+};
+const isoNs = (ns) => new Date(Number(ns / 1000000n)).toISOString()
+  .replace(/Z$/, String(ns % 1000000n).padStart(6, '0') + '+00:00');
+// The instant 1 microsecond before another.
+const minus1us = (iso) => isoNs(nsOf(iso) - 1000n);
 const enc = encodeURIComponent;
 
 async function reset(fx = FX(), base = BASE) {
@@ -67,6 +74,10 @@ test('payment created_at: strictly increasing server clock, RFC 3339 with offset
   const times = ps.map((p) => p.created_at);
   assert.equal(new Set(times).size, 30, 'server instants are unique');
   for (const t of times) assert.match(t, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}\+00:00$/);
+  // reading at wall-clock "now" right after paying sees the payment (the clock does not run ahead)
+  const p = await pay(w.ada, 'bob', 1);
+  assert.equal((await me(w.ada, `?as_of=${enc(new Date().toISOString())}`)).body.balance, 10000 - 31);
+  assert.ok(nsOf(p.created_at) <= nsOf(new Date().toISOString()) + 1000000n);
   const feed = (await call('GET', '/activity?limit=200', { token: w.ada })).body.payments.map((p) => p.created_at);
   assert.deepEqual(feed, [...feed].sort().reverse());
 });
@@ -386,6 +397,45 @@ test('stage-1 and stage-2 exports import into stage-3 with a derived ledger', as
   assert.equal(s2.entries.length, 1); assert.equal(s2.entries[0].payment.authorization_id, h1.authorization_id);
   const h3 = await call('POST', '/authorizations', { token: a2, key: k(), body: { to_handle: 'bob', amount: 1 } });
   assert.equal(ms(h3.body.expires_at) - ms(h3.body.created_at), 900000);
+});
+
+test('G9: an import with a future-dated expired hold never drags the clock (stage-2 and stage-3 sources, then reset)', async () => {
+  const fx = { currency: 'EUR', minor_units: 2, users: [U('ada', 100), U('bob', 0)],
+    authorizations: [{ id: 'a1', from_user_id: 'u_ada', to_user_id: 'u_bob', amount: 5, status: 'expired', expires_at: isoMs(Date.now() + 2 * 3600e3) }] };
+  const nearNow = (iso, what) => assert.ok(Math.abs(ms(iso) - Date.now()) < 1000, `${what}: ${iso} is not within 1 s of wall time ${isoMs(Date.now())}`);
+  for (const source of ['stage-2', 'stage-3']) {
+    const base = source === 'stage-2' ? S2BASE : BASE;
+    await reset(fx, base);
+    const ex = (await call('GET', '/_test/export', { base })).body;
+    assert.equal((await call('POST', '/_test/import', { body: ex })).status, 204);
+    const ada = await login('ada');
+    const p = await pay(ada, 'bob', 1);
+    nearNow(p.created_at, `${source} import: payment`);
+    const h = (await call('POST', '/authorizations', { token: ada, key: k(), body: { to_handle: 'bob', amount: 1 } })).body;
+    nearNow(h.created_at, `${source} import: hold`);
+    assert.equal(ms(h.expires_at) - ms(h.created_at), 600000);
+    assert.equal((await me(ada, `?as_of=${enc(isoMs(Date.now() + 50))}`)).body.balance, 99, 'as_of at wall now sees the fresh payment');
+    await reset(FX());
+    const a2 = await login('ada');
+    nearNow((await pay(a2, 'bob', 1)).created_at, `${source} import then reset: payment`);
+  }
+});
+
+test('G10: snapshots are compact and page byte-identically after heavy statement load', async () => {
+  const w = await world(FX({ users: [U('ada', 1000000), U('bob', 1000000), U('cy', 500)] }));
+  for (let i = 0; i < 100; i++) await Promise.all(Array.from({ length: 5 }, (_, j) => pay((i + j) % 2 ? w.ada : w.bob, (i + j) % 2 ? 'bob' : 'ada', 1 + j)));
+  const first = await call('GET', '/statement?limit=200&offset=100', { token: w.ada });
+  const token = first.body.snapshot;
+  const before = JSON.stringify(first.body);
+  const n = Number(process.env.STATEMENTS || 300);
+  for (let i = 0; i < n; i += 25) await Promise.all(Array.from({ length: 25 }, () => call('GET', '/statement?limit=1', { token: w.ada })));
+  await pay(w.ada, 'bob', 7);
+  const after = await call('GET', `/statement?snapshot=${token}&limit=200&offset=100`, { token: w.ada });
+  assert.equal(JSON.stringify(after.body), before);
+  assert.equal(first.body.entries.length, 200);
+  const ex = (await call('GET', '/_test/export')).body;
+  const snap = ex.state.snapshots.find((e) => e[0] === token)[1];
+  assert.ok(Array.isArray(snap.entries[0]) && snap.entries[0].length === 4, 'entries are compact references');
 });
 
 (async () => {
