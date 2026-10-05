@@ -1,7 +1,6 @@
 'use strict';
-// Pocketful stage 3 — stages 1–2 (payments, requests, splits, settlements, holds, web UI) plus a
-// temporal ledger: payment revisions and corrections, opening balances, historical balances and
-// holds (as_of / known_at) and paginated statements with frozen snapshots.
+// Pocketful stage 4 — stages 1–3 (payments, requests, splits, settlements, holds, web UI, temporal
+// ledger with corrections, statements and snapshots) plus refunds.
 // Single process, in-memory state. Every check+mutation runs synchronously in
 // one event-loop tick, so the single JS thread linearises all operations.
 // The only async work is scrypt password hashing; state is re-checked after it.
@@ -131,6 +130,7 @@ function emptyState(currency, minorUnits) {
     revs: new Map(),      // payment id -> revisions [{revision, amount, effective_at, recorded_at, reason, effNs, recNs}]
     snapshots: new Map(), // statement snapshot token -> frozen statement (entries as compact references)
     payIndex: new Map(),  // payment id -> payment
+    refunded: new Map(),  // payment id -> Σ amounts of refunds with refund_of = that payment
   };
 }
 let state = emptyState('EUR', 2);
@@ -162,11 +162,23 @@ const reqView = (r) => ({ ...r });
 // effective_at = recorded_at = created_at. A user's total at (as_of T, known_at K) is
 //   opening + Σ signed amount of each of their payments' latest revision recorded <= K,
 //   counted when that revision's effective_at <= T.
-function revision(rev, amount, effectiveAt, recordedAt, reason) {
-  return { revision: rev, amount, effective_at: effectiveAt, recorded_at: recordedAt, reason,
+function revision(rev, amount, effectiveAt, recordedAt, reason, batchId = null) {
+  return { revision: rev, amount, effective_at: effectiveAt, recorded_at: recordedAt, reason, correction_batch_id: batchId,
     effNs: parseInstant(effectiveAt), recNs: parseInstant(recordedAt) };
 }
-const revView = (r) => ({ revision: r.revision, amount: r.amount, effective_at: r.effective_at, recorded_at: r.recorded_at, reason: r.reason });
+const revView = (r) => ({ revision: r.revision, amount: r.amount, effective_at: r.effective_at, recorded_at: r.recorded_at,
+  reason: r.reason, correction_batch_id: r.correction_batch_id });
+// I24: a payment's recorded_at values strictly increase. A new revision is recorded at the next clock
+// tick, or 1 ms after the payment's last recorded_at if that is later (an imported history may run
+// ahead of this clock); the clock is raised to the chosen instant.
+function nextRecordedMs(revs) {
+  const t = Math.max(clockMs(), Number(revs[revs.length - 1].recNs / NS_PER_MS) + 1);
+  lastMs = Math.max(lastMs, t);
+  return t;
+}
+// Refunds: Σ refunded per target payment (I20: never above the target's current corrected amount).
+const refundedOf = (st, pid) => st.refunded.get(pid) || 0;
+const latestAmount = (st, pid) => { const revs = st.revs.get(pid); return revs[revs.length - 1].amount; };
 function recordOriginal(st, p) {
   st.revs.set(p.payment_id, [revision(1, p.amount, p.created_at, p.created_at, '')]);
   st.payIndex.set(p.payment_id, p);
@@ -414,7 +426,7 @@ async function buildFromFixture(fx) {
       payment_id: p.id, from_user_id: from.id, from_handle: from.handle, to_user_id: to.id, to_handle: to.handle,
       amount: p.amount, currency: st.currency, note: p.note === undefined ? '' : p.note,
       visibility: p.visibility === undefined ? 'public' : p.visibility,
-      request_id: null, settlement_id: null, authorization_id: null, created_at: createdAt,
+      request_id: null, settlement_id: null, authorization_id: null, refund_of: null, created_at: createdAt,
     };
     st.payments.push(pay);
     recordOriginal(st, pay);
@@ -533,11 +545,13 @@ function importState(doc) {
     need((p.request_id === null || str(p.request_id)) && (p.settlement_id === null || str(p.settlement_id)) && ts(p.created_at), 'payment refs');
     const authId = p.authorization_id === undefined ? null : p.authorization_id;
     need(authId === null || str(authId), 'payment authorization_id');
+    const refundOf = p.refund_of === undefined ? null : p.refund_of; // older stages carry none
+    need(refundOf === null || str(refundOf), 'payment refund_of');
     pids.add(p.payment_id);
     st.payments.push({
       payment_id: p.payment_id, from_user_id: p.from_user_id, from_handle: p.from_handle, to_user_id: p.to_user_id,
       to_handle: p.to_handle, amount: p.amount, currency: p.currency, note: p.note, visibility: p.visibility,
-      request_id: p.request_id, settlement_id: p.settlement_id, authorization_id: authId, created_at: p.created_at,
+      request_id: p.request_id, settlement_id: p.settlement_id, authorization_id: authId, refund_of: refundOf, created_at: p.created_at,
     });
   }
   // Feed and ledger order is by created_at (stable for equal instants).
@@ -551,8 +565,9 @@ function importState(doc) {
       const p = payById.get(e[0]);
       const revs = e[1].map((r, i) => {
         need(isObj(r) && r.revision === i + 1 && Number.isInteger(r.amount) && r.amount >= 0 && r.amount <= MAX_AMOUNT
-          && typeof r.reason === 'string' && ts(r.effective_at) && ts(r.recorded_at), 'revision fields');
-        return revision(r.revision, r.amount, r.effective_at, r.recorded_at, r.reason);
+          && typeof r.reason === 'string' && ts(r.effective_at) && ts(r.recorded_at)
+          && (r.correction_batch_id === undefined || r.correction_batch_id === null || str(r.correction_batch_id)), 'revision fields');
+        return revision(r.revision, r.amount, r.effective_at, r.recorded_at, r.reason, r.correction_batch_id || null);
       });
       need(revs[0].amount === p.amount && revs[0].effective_at === p.created_at && revs[0].recorded_at === p.created_at && revs[0].reason === '', 'original revision');
       for (let i = 1; i < revs.length; i++) need(revs[i].recNs > revs[i - 1].recNs, 'recorded_at order');
@@ -566,6 +581,16 @@ function importState(doc) {
       st.users.get(p.to_user_id).opening -= p.amount;
     }
   }
+  // Refund links: a refund reverses a non-refund target between the same two wallets, and the
+  // refunds of a payment never exceed its current corrected amount (I20).
+  for (const p of st.payments) {
+    if (p.refund_of === null) continue;
+    const t = payById.get(p.refund_of);
+    need(t && t.refund_of === null && p.from_user_id === t.to_user_id && p.to_user_id === t.from_user_id
+      && p.request_id === null && p.authorization_id === null && p.settlement_id === null, 'refund target');
+    st.refunded.set(t.payment_id, refundedOf(st, t.payment_id) + latestAmount(st, p.payment_id));
+  }
+  for (const [pid, sum] of st.refunded) need(sum <= latestAmount(st, pid), 'refunds exceed the payment');
   // Ledger identity: each balance = opening + net of the latest revisions.
   const farFuture = nsOfMs(MAX_DATE_MS) * 2n;
   for (const u of st.users.values()) need(totalAt(st, u, farFuture, farFuture) === u.balance, 'balance does not match the ledger');
@@ -691,12 +716,13 @@ function userByHandleOr404(st, h) {
   return st.users.get(id);
 }
 
-function makePayment(st, from, to, amount, note, visibility, requestId, settlementId, ts, authorizationId = null) {
+function makePayment(st, from, to, amount, note, visibility, requestId, settlementId, ts, authorizationId = null, refundOf = null) {
   const p = {
     payment_id: newId(st, 'p_'), from_user_id: from.id, from_handle: from.handle,
     to_user_id: to.id, to_handle: to.handle, amount, currency: st.currency, note, visibility,
-    request_id: requestId, settlement_id: settlementId, authorization_id: authorizationId, created_at: ts,
+    request_id: requestId, settlement_id: settlementId, authorization_id: authorizationId, refund_of: refundOf, created_at: ts,
   };
+  if (refundOf) st.refunded.set(refundOf, refundedOf(st, refundOf) + amount);
   from.balance -= amount;
   to.balance += amount;
   st.payments.push(p);
@@ -838,12 +864,13 @@ const ops = {
     const effNs = parseInstant(body.effective_at);
     if (effNs === null) throw invalid('effective_at must be an RFC 3339 instant with an offset');
     if (effNs > nsOfMs(nowMs)) throw invalid('effective_at must not be later than now');
-    if (p.settlement_id || p.authorization_id) {
-      throw new ApiError(422, 'linked_payment_immutable', 'settlement members and captures cannot be corrected');
+    if (p.settlement_id || p.authorization_id || p.refund_of) {
+      throw new ApiError(422, 'linked_payment_immutable', 'settlement members, captures and refunds cannot be corrected singly');
     }
     const revs = st.revs.get(pid);
     const latest = revs[revs.length - 1];
     if (er !== latest.revision) throw new ApiError(409, 'stale_revision', `the latest revision is ${latest.revision}`);
+    if (amount < refundedOf(st, pid)) throw new ApiError(422, 'refund_exceeds_payment', 'the payment has already been refunded beyond that amount');
     const from = st.users.get(p.from_user_id), to = st.users.get(p.to_user_id);
     // An increase debits the original sender; a decrease debits the original receiver.
     const diff = amount - latest.amount;
@@ -851,7 +878,7 @@ const ops = {
     if (debtor && availableOf(st, debtor, nowMs) < Math.abs(diff)) {
       throw new ApiError(409, 'insufficient_funds', 'the debited wallet cannot afford this correction');
     }
-    const recMs = clockMs();
+    const recMs = nextRecordedMs(revs);
     const rev = revision(latest.revision + 1, amount, body.effective_at, isoOf(recMs), reason);
     revs.push(rev);
     const nowNs = nsOfMs(recMs);
@@ -862,6 +889,23 @@ const ops = {
     from.balance -= diff;
     to.balance += diff;
     return { payment_id: pid, ...revView(rev) };
+  },
+
+  // POST /payments/{id}/refunds (H1 after replay/reuse): 404 → 403 (not the original receiver) →
+  // 422 amount → 422 invalid_refund_target → 422 refund_exceeds_payment → 409 insufficient_funds.
+  refund(st, me, body, pid) {
+    const p = st.payIndex.get(pid);
+    if (!p) throw notFound('no such payment');
+    if (p.to_user_id !== me.id) throw forbidden();
+    const amount = checkAmount(body.amount, has(body, 'amount'));
+    if (p.refund_of) throw new ApiError(422, 'invalid_refund_target', 'a refund cannot itself be refunded');
+    if (refundedOf(st, pid) + amount > latestAmount(st, pid)) {
+      throw new ApiError(422, 'refund_exceeds_payment', 'refunds would exceed the payment');
+    }
+    const now = clockMs();
+    if (availableOf(st, me, now) < amount) throw new ApiError(409, 'insufficient_funds', 'insufficient available funds');
+    // The reverse movement, with the original note and visibility; requests, holds and settlements are untouched.
+    return makePayment(st, me, st.users.get(p.from_user_id), amount, p.note, p.visibility, null, null, isoOf(now), null, pid);
   },
 
   settlements(st, me, body) {
@@ -896,7 +940,7 @@ const ops = {
       const p = {
         payment_id: newId(st, 'p_'), from_user_id: x.from.id, from_handle: x.from.handle,
         to_user_id: x.to.id, to_handle: x.to.handle, amount: x.amount, currency: st.currency,
-        note: x.note, visibility: x.visibility, request_id: null, settlement_id: sid, authorization_id: null, created_at: ts,
+        note: x.note, visibility: x.visibility, request_id: null, settlement_id: sid, authorization_id: null, refund_of: null, created_at: ts,
       };
       st.payments.push(p);
       recordOriginal(st, p);
@@ -1203,6 +1247,8 @@ const ROUTES = [
   ['POST', /^\/payments$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'payments', {})],
   ['POST', /^\/payments\/([^/]+)\/corrections$/, (req, res, raw, m, path) =>
     idempotent(req, res, raw, path, 'correct', { arg: m[1] })],
+  ['POST', /^\/payments\/([^/]+)\/refunds$/, (req, res, raw, m, path) =>
+    idempotent(req, res, raw, path, 'refund', { arg: m[1] })],
   ['GET', /^\/payments\/([^/]+)\/revisions$/, (req, res, raw, m) => {
     const st = state, me = authenticate(st, req);
     send(res, 200, paymentRevisions(st, me, m[1]));
@@ -1351,4 +1397,4 @@ server.on('clientError', (err, socket) => {
     socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
   } else socket.destroy();
 });
-server.listen(PORT, '0.0.0.0', () => console.log(`pocketful stage 3 listening on 0.0.0.0:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`pocketful stage 4 listening on 0.0.0.0:${PORT}`));

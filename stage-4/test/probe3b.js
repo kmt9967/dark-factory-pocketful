@@ -48,7 +48,9 @@ const correct = (t, pid, body, key = k()) => call('POST', `/payments/${pid}/corr
 const C = (er, amount, effective_at, reason = 'fix') => ({ expected_revision: er, amount, effective_at, reason });
 const bal = async (t, qs = '') => (await call('GET', '/me' + qs, { token: t })).body.balance;
 const err = (r, status, code) => { assert.equal(r.status, status, JSON.stringify(r.body)); if (code) assert.equal(r.body.error.code, code, JSON.stringify(r.body)); };
-const nowIso = () => new Date().toISOString().replace('Z', '+00:00');
+// "Now" for effective_at, 1.5 s in the past: a client's clock reading can be a few ms ahead of the
+// server's on this host, and the server rightly rejects an effective_at later than its now.
+const nowIso = () => new Date(Date.now() - 1500).toISOString().replace('Z', '+00:00');
 const tests = [];
 const test = (n, f) => tests.push([n, f]);
 
@@ -58,7 +60,9 @@ test('increase, decrease, zero: money moves between the same two wallets; respon
   const eff = toOffset(p.created_at, 2);
   const r = await correct(w.ada, p.payment_id, C(1, 1500, eff, 'forgot the tip'));
   assert.equal(r.status, 201, JSON.stringify(r.body));
-  assert.deepEqual(Object.keys(r.body).sort(), ['amount', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
+  // stage 4 adds correction_batch_id (null for single corrections)
+  assert.deepEqual(Object.keys(r.body).sort(), ['amount', 'correction_batch_id', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
+  assert.equal(r.body.correction_batch_id, null);
   assert.equal(r.body.revision, 2); assert.equal(r.body.amount, 1500); assert.equal(r.body.effective_at, eff);
   assert.equal(r.body.reason, 'forgot the tip'); assert.match(r.body.recorded_at, /\+00:00$/);
   assert.ok(nsOf(r.body.recorded_at) > nsOf(p.created_at));
@@ -170,6 +174,7 @@ test('historical_overdraft: moving a payment backwards across another (total)', 
   const r = await correct(w.cy, t2.payment_id, C(1, 1200, t1.created_at));
   assert.equal(r.status, 201, JSON.stringify(r.body));
   // and moving it forward again is fine
+  await sleep(1600); // nowIso() trails real time by 1.5 s
   assert.equal((await correct(w.cy, t2.payment_id, C(2, 1200, nowIso()))).status, 201);
   assert.equal(await bal(w.cy), 300);
 });
@@ -189,6 +194,7 @@ test('historical_overdraft: only historical AVAILABLE goes negative because of a
   assert.equal((await correct(w.ada, p.payment_id, C(1, 1000, p.created_at))).status, 201);
   assert.equal((await call('GET', `/me?as_of=${enc(a.created_at)}`, { token: w.ada })).body.available, 0);
   // effective after the void: the hold no longer constrains it
+  await sleep(1600); // nowIso() trails real time by 1.5 s
   assert.equal((await correct(w.ada, p.payment_id, C(2, 1400, nowIso()))).status, 201);
 });
 
@@ -310,11 +316,12 @@ test('export/import of a corrected state; stage discipline (no stage-4 surfaces)
   assert.equal(r3.status, 201); assert.ok(nsOf(r3.body.recorded_at) > nsOf(r.body.recorded_at));
   const bad = JSON.parse(JSON.stringify(ex)); bad.state.revisions[0][1][1].amount += 1;
   err(await call('POST', '/_test/import', { body: bad }), 422, 'validation_failed');
-  err(await call('POST', `/payments/${p.payment_id}/refunds`, { token: w.ada, key: k(), body: {} }), 404);
+  // stage 4: refunds exist (the sender may not refund), payments carry refund_of: null
+  err(await call('POST', `/payments/${p.payment_id}/refunds`, { token: w.ada, key: k(), body: { amount: 1 } }), 403, 'forbidden');
   err(await call('POST', '/refunds', { token: w.ada, key: k(), body: {} }), 404);
   err(await call('POST', '/corrections', { token: w.ada, key: k(), body: {} }), 404);
   const pv = (await call('GET', '/activity', { token: w.ada })).body.payments[0];
-  assert.ok(!('refund_of' in pv) && !('correction_batch_id' in pv));
+  assert.equal(pv.refund_of, null);
 });
 
 (async () => {
