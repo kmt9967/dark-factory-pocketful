@@ -141,6 +141,10 @@ empty repository containing only the mandates.
 - The verifier can only run the *shipped* part of each suite; hidden-suite coverage depends on the reviewer's
   spec-driven probes.
 
-- `room.json` contains four `error` events from the Implementer: four of its background harness runs exited non-zero.
-  These were the Implementer's own in-progress check runs, three of them against a not-yet-finished stage; each was
-  followed by a passing run before it handed the work on. They are left in the export unchanged.
+- `room.json` contains four `error` events. Each one is BAND reporting that a background harness run by the
+  Implementer exited with code 1, at 23:14, 00:30, 01:00 and 02:00 UTC. Each matches a run on a *partial* work item:
+  stage-2 API-only, W3a twice and W4a. The next suite cannot pass yet on a partial item, so the harness exits non-zero
+  (`checks/pf-s2-impl-3`, `pf-s3-impl-1/2` and `pf-s4-impl-1` show `highest contiguous stage` one below the target).
+  The last work item of each stage then passed: `pf-s2-impl-4` claims 2, `pf-s3-impl-3` claims 3 and
+  `pf-s4-impl-2` claims 4. Running these in the background goes against the mandate's "foreground checks" rule, which
+  the Implementer did not always follow. The events are left in the export unchanged.
