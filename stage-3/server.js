@@ -1,7 +1,7 @@
 'use strict';
 // Pocketful stage 3 — stages 1–2 (payments, requests, splits, settlements, holds, web UI) plus a
-// temporal ledger: payment revisions, opening balances, historical balances and holds
-// (as_of / known_at) and paginated statements with frozen snapshots.
+// temporal ledger: payment revisions and corrections, opening balances, historical balances and
+// holds (as_of / known_at) and paginated statements with frozen snapshots.
 // Single process, in-memory state. Every check+mutation runs synchronously in
 // one event-loop tick, so the single JS thread linearises all operations.
 // The only async work is scrypt password hashing; state is re-checked after it.
@@ -218,6 +218,35 @@ function heldAt(st, uid, T, K) {
     h += Math.max(0, a.amount - cap);
   }
   return h;
+}
+// I18: under the latest revisions, a user's total and total − held must be nonnegative at every
+// boundary up to now — the effective times of their payments and their hold event times
+// (creation, captures, closes, expiries) — with all movements at one instant combined.
+function historyIsSound(st, u, nowNs) {
+  const moves = [];
+  for (const p of st.payments) {
+    if (p.from_user_id !== u.id && p.to_user_id !== u.id) continue;
+    const revs = st.revs.get(p.payment_id);
+    const r = revs[revs.length - 1];
+    moves.push([r.effNs, signedFor(p, u.id, r.amount)]);
+  }
+  const bounds = new Set();
+  for (const [t] of moves) bounds.add(t);
+  for (const a of st.auths.values()) {
+    if (a.from_user_id !== u.id || a.seededClosed) continue;
+    bounds.add(a.createdNs);
+    for (const c of a.captures) bounds.add(c.ns);
+    if (a.closedNs !== null) bounds.add(a.closedNs);
+    bounds.add(a.expNs);
+  }
+  moves.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  const sorted = [...bounds].filter((b) => b !== null && b <= nowNs).sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+  let total = u.opening, i = 0;
+  for (const b of sorted) {
+    while (i < moves.length && moves[i][0] <= b) total += moves[i++][1];
+    if (total < 0 || total - heldAt(st, u.id, b, nowNs) < 0) return false;
+  }
+  return true;
 }
 function authView(st, a, now) {
   const f = st.users.get(a.from_user_id), t = st.users.get(a.to_user_id);
@@ -794,6 +823,47 @@ const ops = {
     return { split_id: splitId, amount, currency: st.currency, note, shares, requests, created_at: ts };
   },
 
+  // POST /payments/{id}/corrections (G4 order after replay/reuse): 404 → 403 → 422 fields →
+  // 422 linked_payment_immutable → 409 stale_revision → 409 insufficient_funds → 409 historical_overdraft.
+  correct(st, me, body, pid) {
+    const p = st.payIndex.get(pid);
+    if (!p) throw notFound('no such payment');
+    if (p.from_user_id !== me.id) throw forbidden();
+    const nowMs = readMs();
+    const isInt = (v) => typeof v === 'number' && Number.isSafeInteger(v);
+    const er = body.expected_revision, amount = body.amount, reason = body.reason;
+    if (!isInt(er) || er < 1) throw invalid('expected_revision must be a positive integer');
+    if (!isInt(amount) || amount < 0 || amount > MAX_AMOUNT) throw invalid('amount must be an integer from 0 to 1000000000');
+    if (typeof reason !== 'string' || cpLen(reason) < 1 || cpLen(reason) > 200) throw invalid('reason must be 1 to 200 characters');
+    const effNs = parseInstant(body.effective_at);
+    if (effNs === null) throw invalid('effective_at must be an RFC 3339 instant with an offset');
+    if (effNs > nsOfMs(nowMs)) throw invalid('effective_at must not be later than now');
+    if (p.settlement_id || p.authorization_id) {
+      throw new ApiError(422, 'linked_payment_immutable', 'settlement members and captures cannot be corrected');
+    }
+    const revs = st.revs.get(pid);
+    const latest = revs[revs.length - 1];
+    if (er !== latest.revision) throw new ApiError(409, 'stale_revision', `the latest revision is ${latest.revision}`);
+    const from = st.users.get(p.from_user_id), to = st.users.get(p.to_user_id);
+    // An increase debits the original sender; a decrease debits the original receiver.
+    const diff = amount - latest.amount;
+    const debtor = diff > 0 ? from : diff < 0 ? to : null;
+    if (debtor && availableOf(st, debtor, nowMs) < Math.abs(diff)) {
+      throw new ApiError(409, 'insufficient_funds', 'the debited wallet cannot afford this correction');
+    }
+    const recMs = clockMs();
+    const rev = revision(latest.revision + 1, amount, body.effective_at, isoOf(recMs), reason);
+    revs.push(rev);
+    const nowNs = nsOfMs(recMs);
+    if (!historyIsSound(st, from, nowNs) || !historyIsSound(st, to, nowNs)) {
+      revs.pop(); // nothing else was touched
+      throw new ApiError(409, 'historical_overdraft', 'this correction would make a past balance negative');
+    }
+    from.balance -= diff;
+    to.balance += diff;
+    return { payment_id: pid, ...revView(rev) };
+  },
+
   settlements(st, me, body) {
     const tr = body.transfers;
     if (!Array.isArray(tr) || tr.length < 1 || tr.length > 32) throw invalid('transfers must be an array of 1 to 32 items');
@@ -995,6 +1065,13 @@ function statement(st, me, q) {
   return statementPage(st, token, snap, pg);
 }
 
+function paymentRevisions(st, me, pid) {
+  const p = st.payIndex.get(pid);
+  // Only the two parties may read a payment's history; anyone else learns nothing (404).
+  if (!p || (p.from_user_id !== me.id && p.to_user_id !== me.id)) throw notFound('no such payment');
+  return { revisions: st.revs.get(pid).map(revView) };
+}
+
 function decideRequest(st, me, id, action) {
   const r = st.requests.get(id);
   if (!r) throw notFound('no such request');
@@ -1124,6 +1201,12 @@ const ROUTES = [
     send(res, 200, statement(st, me, q));
   }],
   ['POST', /^\/payments$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'payments', {})],
+  ['POST', /^\/payments\/([^/]+)\/corrections$/, (req, res, raw, m, path) =>
+    idempotent(req, res, raw, path, 'correct', { arg: m[1] })],
+  ['GET', /^\/payments\/([^/]+)\/revisions$/, (req, res, raw, m) => {
+    const st = state, me = authenticate(st, req);
+    send(res, 200, paymentRevisions(st, me, m[1]));
+  }],
   ['POST', /^\/requests$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'requests', {})],
   ['GET', /^\/requests$/, negotiated((req, res, raw, m, path, q) => {
     const st = state, me = authenticate(st, req);
