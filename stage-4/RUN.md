@@ -24,3 +24,10 @@ Ledger reads (since stage 3): `GET /me?as_of=<RFC 3339>&known_at=<RFC 3339>` ret
 balance/available/held, and `GET /statement?from=&to=&known_at=&limit=&offset=` returns a paginated
 statement with a `snapshot` token (`GET /statement?snapshot=<token>&limit=&offset=` pages it).
 Write the offset's `+` raw or as `%2B`; both mean `+`.
+
+Refunds and batch corrections (stage 4): the original receiver refunds with
+`POST /payments/{id}/refunds` `{"amount": 200}` (Idempotency-Key required; the refund is a reverse
+payment with `refund_of`). A settlement operator corrects several payments at once with
+`POST /correction-batches` `{"corrections": [{"payment_id", "expected_revision", "amount",
+"effective_at", "reason"}, ...]}` (Idempotency-Key required; settlement members must be corrected
+together, at one effective instant).

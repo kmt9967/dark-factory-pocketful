@@ -1,6 +1,6 @@
 'use strict';
 // Pocketful stage 4 — stages 1–3 (payments, requests, splits, settlements, holds, web UI, temporal
-// ledger with corrections, statements and snapshots) plus refunds.
+// ledger with corrections, statements and snapshots) plus refunds and correction batches.
 // Single process, in-memory state. Every check+mutation runs synchronously in
 // one event-loop tick, so the single JS thread linearises all operations.
 // The only async work is scrypt password hashing; state is re-checked after it.
@@ -740,6 +740,19 @@ function makeRequest(st, requester, payer, amount, note, ts) {
   return r;
 }
 
+// The ordinary correction fields (G4): all invalid input is 422, wrong JSON types included.
+function correctionFields(body, nowMs) {
+  const isInt = (v) => typeof v === 'number' && Number.isSafeInteger(v);
+  const er = body.expected_revision, amount = body.amount, reason = body.reason;
+  if (!isInt(er) || er < 1) throw invalid('expected_revision must be a positive integer');
+  if (!isInt(amount) || amount < 0 || amount > MAX_AMOUNT) throw invalid('amount must be an integer from 0 to 1000000000');
+  if (typeof reason !== 'string' || cpLen(reason) < 1 || cpLen(reason) > 200) throw invalid('reason must be 1 to 200 characters');
+  const effNs = parseInstant(body.effective_at);
+  if (effNs === null) throw invalid('effective_at must be an RFC 3339 instant with an offset');
+  if (effNs > nsOfMs(nowMs)) throw invalid('effective_at must not be later than now');
+  return { er, amount, reason, effNs };
+}
+
 const ops = {
   payments(st, me, body) {
     typeStr(body, 'to_handle');
@@ -856,14 +869,7 @@ const ops = {
     if (!p) throw notFound('no such payment');
     if (p.from_user_id !== me.id) throw forbidden();
     const nowMs = readMs();
-    const isInt = (v) => typeof v === 'number' && Number.isSafeInteger(v);
-    const er = body.expected_revision, amount = body.amount, reason = body.reason;
-    if (!isInt(er) || er < 1) throw invalid('expected_revision must be a positive integer');
-    if (!isInt(amount) || amount < 0 || amount > MAX_AMOUNT) throw invalid('amount must be an integer from 0 to 1000000000');
-    if (typeof reason !== 'string' || cpLen(reason) < 1 || cpLen(reason) > 200) throw invalid('reason must be 1 to 200 characters');
-    const effNs = parseInstant(body.effective_at);
-    if (effNs === null) throw invalid('effective_at must be an RFC 3339 instant with an offset');
-    if (effNs > nsOfMs(nowMs)) throw invalid('effective_at must not be later than now');
+    const { er, amount, reason } = correctionFields(body, nowMs);
     if (p.settlement_id || p.authorization_id || p.refund_of) {
       throw new ApiError(422, 'linked_payment_immutable', 'settlement members, captures and refunds cannot be corrected singly');
     }
@@ -889,6 +895,80 @@ const ops = {
     from.balance -= diff;
     to.balance += diff;
     return { payment_id: pid, ...revView(rev) };
+  },
+
+  // POST /correction-batches (H4 after operator/key/replay): shape 422 → items in input order
+  // (fields 422 → 404 → linked 422 → stale 409 → refund_exceeds_payment 422) → incomplete_settlement
+  // 422 → members' effective instants differ 422 → combined available 409 → combined history 409.
+  correctionBatch(st, me, body) {
+    const items = body.corrections;
+    if (!Array.isArray(items) || items.length < 1 || items.length > 32) throw invalid('corrections must be an array of 1 to 32 items');
+    if (items.some((x) => !isObj(x))) throw invalid('every correction must be an object');
+    const seen = new Set();
+    for (const x of items) {
+      if (typeof x.payment_id !== 'string') continue;
+      if (seen.has(x.payment_id)) throw invalid('payment_ids must be distinct');
+      seen.add(x.payment_id);
+    }
+    const nowMs = readMs();
+    const plan = items.map((x) => {
+      if (typeof x.payment_id !== 'string') throw invalid('payment_id must be a string');
+      const f = correctionFields(x, nowMs);
+      const p = st.payIndex.get(x.payment_id);
+      if (!p) throw notFound(`no such payment ${x.payment_id}`);
+      if (p.authorization_id || p.refund_of) throw new ApiError(422, 'linked_payment_immutable', 'captures and refunds cannot be corrected');
+      const revs = st.revs.get(p.payment_id);
+      const latest = revs[revs.length - 1];
+      if (f.er !== latest.revision) throw new ApiError(409, 'stale_revision', `the latest revision of ${p.payment_id} is ${latest.revision}`);
+      if (f.amount < refundedOf(st, p.payment_id)) throw new ApiError(422, 'refund_exceeds_payment', `${p.payment_id} has already been refunded beyond that amount`);
+      return { p, revs, latest, f, effectiveAt: x.effective_at };
+    });
+    // I23: a settlement is corrected whole, at one effective instant.
+    const bySettlement = new Map();
+    for (const x of plan) {
+      if (!x.p.settlement_id) continue;
+      if (!bySettlement.has(x.p.settlement_id)) bySettlement.set(x.p.settlement_id, []);
+      bySettlement.get(x.p.settlement_id).push(x);
+    }
+    for (const [sid, present] of bySettlement) {
+      const members = st.payments.filter((q) => q.settlement_id === sid).length;
+      if (present.length !== members) throw new ApiError(422, 'incomplete_settlement', `every member of settlement ${sid} must be corrected together`);
+    }
+    for (const present of bySettlement.values()) {
+      if (present.some((x) => x.f.effNs !== present[0].f.effNs)) throw invalid('members of one settlement need identical effective instants');
+    }
+    // Combined current affordability on the net effect of every diff.
+    const net = new Map();
+    const bump = (uid, d) => net.set(uid, (net.get(uid) || 0) + d);
+    for (const x of plan) {
+      const diff = x.f.amount - x.latest.amount;
+      bump(x.p.from_user_id, -diff);
+      bump(x.p.to_user_id, diff);
+    }
+    for (const [uid, d] of net) {
+      if (d < 0 && availableOf(st, st.users.get(uid), nowMs) + d < 0) {
+        throw new ApiError(409, 'insufficient_funds', 'a debited wallet cannot afford this batch');
+      }
+    }
+    // One shared recorded_at, later than every member's previous recorded_at (I22, I24).
+    let recMs = clockMs();
+    for (const x of plan) recMs = Math.max(recMs, Number(x.latest.recNs / NS_PER_MS) + 1);
+    lastMs = Math.max(lastMs, recMs);
+    const recordedAt = isoOf(recMs);
+    const batchId = newId(st, 'cb_');
+    for (const x of plan) x.revs.push(revision(x.latest.revision + 1, x.f.amount, x.effectiveAt, recordedAt, x.f.reason, batchId));
+    const nowNs = nsOfMs(recMs);
+    for (const uid of net.keys()) {
+      if (!historyIsSound(st, st.users.get(uid), nowNs)) {
+        for (const x of plan) x.revs.pop(); // nothing else was touched
+        throw new ApiError(409, 'historical_overdraft', 'this batch would make a past balance negative');
+      }
+    }
+    for (const [uid, d] of net) st.users.get(uid).balance += d;
+    return {
+      correction_batch_id: batchId, recorded_at: recordedAt,
+      revisions: plan.map((x) => ({ payment_id: x.p.payment_id, ...revView(x.revs[x.revs.length - 1]) })),
+    };
   },
 
   // POST /payments/{id}/refunds (H1 after replay/reuse): 404 → 403 (not the original receiver) →
@@ -1321,6 +1401,8 @@ const ROUTES = [
   }],
   ['POST', /^\/settlements$/, (req, res, raw, m, path) =>
     idempotent(req, res, raw, path, 'settlements', { operatorOnly: true })],
+  ['POST', /^\/correction-batches$/, (req, res, raw, m, path) =>
+    idempotent(req, res, raw, path, 'correctionBatch', { operatorOnly: true })],
 ];
 
 // Query parameters: percent-decoded, but a raw '+' stays '+' (instants carry '+HH:MM' offsets).
