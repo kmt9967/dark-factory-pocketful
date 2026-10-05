@@ -1,6 +1,7 @@
 'use strict';
-// Pocketful stage 2 — stage 1 (payments, requests, splits, settlements) plus
-// payment authorisations (holds) with captures, voids and clock-driven expiry.
+// Pocketful stage 3 — stages 1–2 (payments, requests, splits, settlements, holds, web UI) plus a
+// temporal ledger: payment revisions, opening balances, historical balances and holds
+// (as_of / known_at) and paginated statements with frozen snapshots.
 // Single process, in-memory state. Every check+mutation runs synchronously in
 // one event-loop tick, so the single JS thread linearises all operations.
 // The only async work is scrypt password hashing; state is re-checked after it.
@@ -18,7 +19,7 @@ const HANDLE_RE = /^[a-z0-9_]{1,20}$/;
 const SCRYPT = { N: 2048, r: 8, p: 1, keylen: 32 };
 const DEFAULT_TTL = 600;
 const MAX_DATE_MS = 253402300799999; // 9999-12-31T23:59:59.999Z, last RFC 3339 instant
-const RFC3339_RE = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+const RFC3339_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:([Zz])|([+-])(\d{2}):(\d{2}))$/;
 const AUTH_STATUSES = ['open', 'captured', 'voided', 'expired'];
 
 // ---------- errors ----------
@@ -51,15 +52,51 @@ function canon(v) {
 }
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
-// Monotone server clock: every timestamp and every expiry decision uses it.
+// Strictly increasing server clock (ms): every call returns a later instant than the one before,
+// so each server-assigned time (created_at, recorded_at, event times, "read began") is unique and
+// a read always sorts after every earlier write.
 let lastMs = 0;
 function clockMs() {
-  lastMs = Math.max(Date.now(), lastMs);
+  lastMs = Math.max(Date.now(), lastMs + 1);
   return lastMs;
 }
 const isoOf = (ms) => new Date(Math.min(ms, MAX_DATE_MS)).toISOString().replace('Z', '+00:00');
 const nowIso = () => isoOf(clockMs());
-const rfc3339Ms = (v) => (typeof v === 'string' && RFC3339_RE.test(v) ? Date.parse(v) : NaN);
+
+// Strict RFC 3339 instant -> exact epoch nanoseconds (BigInt), or null. Valid calendar dates only,
+// an explicit offset (Z or ±HH:MM) is required, and a fraction may have any number of digits.
+const NS_PER_MS = 1000000n;
+function daysFromCivil(y, m, d) {
+  y -= m <= 2 ? 1 : 0;
+  const era = Math.floor(y / 400), yoe = y - era * 400;
+  const doy = Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
+  return era * 146097 + yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy - 719468;
+}
+function parseInstant(v) {
+  if (typeof v !== 'string') return null;
+  const m = RFC3339_RE.exec(v);
+  if (!m) return null;
+  const [y, mo, d, h, mi, se] = m.slice(1, 7).map(Number);
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const dim = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (mo < 1 || mo > 12 || d < 1 || d > dim[mo - 1] || h > 23 || mi > 59 || se > 59) return null;
+  let off = 0;
+  if (!m[8]) {
+    const oh = Number(m[10]), om = Number(m[11]);
+    if (oh > 23 || om > 59) return null;
+    off = (oh * 60 + om) * (m[9] === '-' ? -1 : 1);
+  }
+  const secs = BigInt(daysFromCivil(y, mo, d)) * 86400n + BigInt(h * 3600 + mi * 60 + se - off * 60);
+  const frac = m[7] ? BigInt((m[7] + '000000000').slice(0, 9)) : 0n;
+  return secs * 1000000000n + frac;
+}
+const nsOfMs = (ms) => BigInt(ms) * NS_PER_MS;
+// Milliseconds rounded up: for integer-ms "now", instant <= now  <=>  ceilMs(instant) <= now.
+const ceilMs = (ns) => Number((ns + NS_PER_MS - 1n) / NS_PER_MS);
+function rfc3339Ms(v) {
+  const ns = parseInstant(v);
+  return ns === null ? NaN : ceilMs(ns);
+}
 
 function hashPassword(password, N = SCRYPT.N) {
   const salt = crypto.randomBytes(16);
@@ -88,6 +125,8 @@ function emptyState(currency, minorUnits) {
     payments: [], requests: new Map(), // requests in insertion (creation) order
     operators: new Set(), idem: new Map(), used: new Set(), counter: 0,
     auths: new Map(), ttl: DEFAULT_TTL, // authorisations in insertion order
+    revs: new Map(),      // payment id -> revisions [{revision, amount, effective_at, recorded_at, reason, effNs, recNs}]
+    snapshots: new Map(), // statement snapshot token -> frozen statement
   };
 }
 let state = emptyState('EUR', 2);
@@ -114,6 +153,34 @@ function insertUser(st, u) {
 
 const reqView = (r) => ({ ...r });
 
+// ---------- ledger ----------
+// Each payment has an append-only revision history; revision 1 is the original amount with
+// effective_at = recorded_at = created_at. A user's total at (as_of T, known_at K) is
+//   opening + Σ signed amount of each of their payments' latest revision recorded <= K,
+//   counted when that revision's effective_at <= T.
+function revision(rev, amount, effectiveAt, recordedAt, reason) {
+  return { revision: rev, amount, effective_at: effectiveAt, recorded_at: recordedAt, reason,
+    effNs: parseInstant(effectiveAt), recNs: parseInstant(recordedAt) };
+}
+const revView = (r) => ({ revision: r.revision, amount: r.amount, effective_at: r.effective_at, recorded_at: r.recorded_at, reason: r.reason });
+function recordOriginal(st, p) {
+  st.revs.set(p.payment_id, [revision(1, p.amount, p.created_at, p.created_at, '')]);
+}
+function selectRev(revs, K) {
+  for (let i = revs.length - 1; i >= 0; i--) if (revs[i].recNs <= K) return revs[i];
+  return null;
+}
+const signedFor = (p, uid, amount) => (p.to_user_id === uid ? amount : -amount);
+function totalAt(st, u, T, K) {
+  let t = u.opening;
+  for (const p of st.payments) {
+    if (p.from_user_id !== u.id && p.to_user_id !== u.id) continue;
+    const r = selectRev(st.revs.get(p.payment_id), K);
+    if (r && r.effNs <= T) t += signedFor(p, u.id, r.amount);
+  }
+  return t;
+}
+
 // ---------- authorisations ----------
 // Stored status is open/captured/voided/expired; an open authorisation whose expires_at is at
 // or before now is effectively expired and holds nothing (derived at every read and write).
@@ -125,6 +192,28 @@ function heldOf(st, uid, now) {
   return h;
 }
 const availableOf = (st, u, now) => u.balance - heldOf(st, u.id, now);
+// closed_at: null while effectively open; the event time once captured/voided; expires_at once expired.
+function closedAtOf(a, now) {
+  if (a.status === 'open') return a.expMs <= now ? a.expires_at : null;
+  if (a.status === 'expired') return a.closed_at || a.expires_at;
+  return a.closed_at;
+}
+// Historical hold of one user at (as_of T, known_at K). A hold exists from creation; nonfinal
+// captures reduce it at their time; a final capture or void releases it at its event time; expiry
+// releases it at expires_at, known as soon as the creation is known. Seeded closed holds hold nothing.
+function heldAt(st, uid, T, K) {
+  const m = T < K ? T : K;
+  let h = 0;
+  for (const a of st.auths.values()) {
+    if (a.from_user_id !== uid || a.seededClosed || a.createdNs > m) continue;
+    if (a.closedNs !== null && a.closedNs <= m) continue;
+    if (a.expNs <= T) continue;
+    let cap = a.baseCaptured;
+    for (const c of a.captures) if (c.ns <= m) cap += c.amount;
+    h += Math.max(0, a.amount - cap);
+  }
+  return h;
+}
 function authView(st, a, now) {
   const f = st.users.get(a.from_user_id), t = st.users.get(a.to_user_id);
   return {
@@ -132,17 +221,29 @@ function authView(st, a, now) {
     amount: a.amount, captured_amount: a.captured_amount, remaining_amount: remainingOf(a, now),
     currency: st.currency, note: a.note, visibility: a.visibility, status: effStatus(a, now),
     expires_at: a.expires_at, payment_id: a.payment_ids.length ? a.payment_ids[a.payment_ids.length - 1] : null,
-    payment_ids: [...a.payment_ids], created_at: a.created_at,
+    payment_ids: [...a.payment_ids], created_at: a.created_at, closed_at: closedAtOf(a, now),
   };
 }
-// Stored (exportable) form of an authorisation; expMs/createdMs are recomputed on load.
+// Stored (exportable) form of an authorisation; the ns/ms caches are recomputed on load.
 const authRecord = (a) => ({
   id: a.id, from_user_id: a.from_user_id, to_user_id: a.to_user_id, amount: a.amount,
   captured_amount: a.captured_amount, payment_ids: [...a.payment_ids], note: a.note, visibility: a.visibility,
   status: a.status, expires_at: a.expires_at, created_at: a.created_at,
+  captures: a.captures.map((c) => ({ at: c.at, amount: c.amount })), base_captured: a.baseCaptured,
+  closed_at: a.closed_at, seeded_closed: a.seededClosed,
 });
 function loadAuth(r) {
-  return { ...authRecord(r), expMs: rfc3339Ms(r.expires_at), createdMs: rfc3339Ms(r.created_at) };
+  const captures = (r.captures || []).map((c) => ({ at: c.at, amount: c.amount, ns: parseInstant(c.at) }));
+  const closedAt = r.closed_at === undefined ? null : r.closed_at;
+  return {
+    id: r.id, from_user_id: r.from_user_id, to_user_id: r.to_user_id, amount: r.amount,
+    captured_amount: r.captured_amount, payment_ids: [...r.payment_ids], note: r.note, visibility: r.visibility,
+    status: r.status, expires_at: r.expires_at, created_at: r.created_at,
+    captures, baseCaptured: r.base_captured || 0, closed_at: closedAt, seededClosed: !!r.seeded_closed,
+    expMs: rfc3339Ms(r.expires_at), createdMs: rfc3339Ms(r.created_at),
+    expNs: parseInstant(r.expires_at), createdNs: parseInstant(r.created_at),
+    closedNs: closedAt === null ? null : parseInstant(closedAt),
+  };
 }
 
 // ---------- fixture (reset) ----------
@@ -179,16 +280,27 @@ async function buildFromFixture(fx) {
     ids.add(u.id); emails.add(u.email.toLowerCase()); handles.add(u.handle);
   }
   const ts = nowIso();
+  const tsNs = parseInstant(ts);
   const pids = new Set();
-  const seededPayments = payments.map((p) => {
+  const seededPayments = payments.map((p, i) => {
     if (!isObj(p) || !checkStr(p.id, 64) || pids.has(p.id)) throw invalid('payment id');
     if (!ids.has(p.from_user_id) || !ids.has(p.to_user_id) || p.from_user_id === p.to_user_id) throw invalid('payment users');
     if (!Number.isInteger(p.amount) || p.amount < 1 || p.amount > MAX_AMOUNT) throw invalid('payment amount');
     if (p.note !== undefined && typeof p.note !== 'string') throw invalid('payment note');
     if (p.visibility !== undefined && p.visibility !== 'public' && p.visibility !== 'private') throw invalid('payment visibility');
+    // A seeded payment may carry its own created_at (when it moved money); it may not be in the future.
+    let createdAt = ts, ns = tsNs;
+    if (p.created_at !== undefined) {
+      ns = parseInstant(p.created_at);
+      if (ns === null) throw invalid('payment created_at must be an RFC 3339 instant with an offset');
+      if (ns > tsNs) throw invalid('payment created_at is in the future');
+      createdAt = p.created_at;
+    }
     pids.add(p.id);
-    return p;
+    return { p, createdAt, ns, i };
   });
+  // Feed and ledger order is by created_at; equal instants keep fixture order.
+  seededPayments.sort((x, y) => (x.ns < y.ns ? -1 : x.ns > y.ns ? 1 : x.i - y.i));
   const rids = new Set();
   for (const r of requests) {
     if (!isObj(r) || !checkStr(r.id, 64) || rids.has(r.id)) throw invalid('request id');
@@ -214,7 +326,7 @@ async function buildFromFixture(fx) {
     if (Number.isNaN(expMs)) throw invalid('authorization expires_at');
     let createdAt = ts;
     if (a.created_at !== undefined) {
-      if (Number.isNaN(rfc3339Ms(a.created_at))) throw invalid('authorization created_at');
+      if (parseInstant(a.created_at) === null) throw invalid('authorization created_at');
       createdAt = a.created_at;
     }
     const captured = a.captured_amount === undefined ? (status === 'captured' ? a.amount : 0) : a.captured_amount;
@@ -231,10 +343,15 @@ async function buildFromFixture(fx) {
       else if (pidsOf[pidsOf.length - 1] !== a.payment_id) throw invalid('authorization payment_id');
     }
     aids.add(a.id);
+    // Seeded open holds start at created_at (or reset time) with any seeded captures already taken;
+    // seeded closed holds carry no lifecycle and hold nothing at any time.
     const rec = loadAuth({
       id: a.id, from_user_id: a.from_user_id, to_user_id: a.to_user_id, amount: a.amount, captured_amount: captured,
       payment_ids: pidsOf, note: a.note === undefined ? '' : a.note, visibility: a.visibility === undefined ? 'public' : a.visibility,
       status, expires_at: a.expires_at, created_at: createdAt,
+      captures: [], base_captured: captured,
+      closed_at: status === 'open' ? null : status === 'expired' ? a.expires_at : ts,
+      seeded_closed: status !== 'open',
     });
     const r = remainingOf(rec, tsMs);
     if (r > 0) heldBy.set(a.from_user_id, (heldBy.get(a.from_user_id) || 0) + r);
@@ -254,17 +371,23 @@ async function buildFromFixture(fx) {
   fx.users.forEach((u) => insertUser(st, {
     id: u.id, email: u.email, pwd: { ...hashed.get(u.password) },
     display_name: u.display_name === undefined ? u.handle : u.display_name,
-    handle: u.handle, balance: u.balance,
+    handle: u.handle, balance: u.balance, opening: u.balance,
   }));
-  for (const p of seededPayments) {
+  for (const { p, createdAt } of seededPayments) {
     const from = st.users.get(p.from_user_id), to = st.users.get(p.to_user_id);
     st.used.add(p.id);
-    st.payments.push({
+    const pay = {
       payment_id: p.id, from_user_id: from.id, from_handle: from.handle, to_user_id: to.id, to_handle: to.handle,
       amount: p.amount, currency: st.currency, note: p.note === undefined ? '' : p.note,
       visibility: p.visibility === undefined ? 'public' : p.visibility,
-      request_id: null, settlement_id: null, authorization_id: null, created_at: ts,
-    });
+      request_id: null, settlement_id: null, authorization_id: null, created_at: createdAt,
+    };
+    st.payments.push(pay);
+    recordOriginal(st, pay);
+    // Seeded balances are already net of seeded payments: the opening balance is what each
+    // wallet held before them (not validated as nonnegative, so earlier-stage fixtures load).
+    from.opening += p.amount;
+    to.opening -= p.amount;
   }
   for (const r of requests) {
     const rq = st.users.get(r.requester_id), py = st.users.get(r.payer_id);
@@ -281,6 +404,16 @@ async function buildFromFixture(fx) {
 }
 
 // ---------- export / import ----------
+// Clock high-water mark of a state: its latest stored instant. Deterministic, so re-exporting an
+// imported state reproduces it exactly; import raises the live clock to at least this value.
+function stateClockMs(st) {
+  let maxNs = 0n;
+  const bump = (ns) => { if (ns !== null && ns > maxNs) maxNs = ns; };
+  for (const revs of st.revs.values()) for (const r of revs) { bump(r.effNs); bump(r.recNs); }
+  for (const a of st.auths.values()) { bump(a.createdNs); bump(a.closedNs); for (const c of a.captures) bump(c.ns); }
+  for (const r of st.requests.values()) bump(parseInstant(r.created_at));
+  return Math.min(ceilMs(maxNs), MAX_DATE_MS);
+}
 function exportState(st) {
   return {
     track: 'pocketful', format_version: 1,
@@ -295,6 +428,10 @@ function exportState(st) {
       used_ids: [...st.used],
       authorization_ttl_seconds: st.ttl,
       authorizations: [...st.auths.values()].map(authRecord),
+      ledger_version: 3,
+      clock_ms: stateClockMs(st),
+      revisions: [...st.revs.entries()].map(([pid, revs]) => [pid, revs.map(revView)]),
+      snapshots: [...st.snapshots.entries()],
     }),
   };
 }
@@ -317,6 +454,13 @@ function importState(doc) {
   }
   const sAuths = s.authorizations === undefined ? [] : s.authorizations;
   need(Array.isArray(sAuths), 'authorizations');
+  // Stage-1/2 exports carry no ledger: revisions, opening balances and hold events are derived.
+  const ledger = s.ledger_version === 3;
+  if (s.ledger_version !== undefined) need(ledger, 'ledger_version');
+  if (ledger) {
+    need(Array.isArray(s.revisions) && Array.isArray(s.snapshots), 'ledger collections');
+    need(Number.isSafeInteger(s.clock_ms) && s.clock_ms >= 0, 'clock_ms');
+  }
   const str = (v) => typeof v === 'string' && v.length > 0;
   for (const u of s.users) {
     need(isObj(u) && str(u.id) && u.id.length <= 64 && !st.users.has(u.id), 'user id');
@@ -329,14 +473,15 @@ function importState(doc) {
       && typeof p.hash === 'string' && /^[0-9a-f]{2,}$/.test(p.hash) && p.hash.length % 2 === 0
       && [p.N, p.r, p.p].every((x) => Number.isSafeInteger(x) && x > 0)
       && (p.N & (p.N - 1)) === 0 && p.N <= 1 << 16 && p.r <= 32 && p.p <= 16, 'password hash');
+    if (ledger) need(Number.isSafeInteger(u.opening), 'opening balance');
     insertUser(st, { id: u.id, email: u.email, pwd: { alg: 'scrypt', N: p.N, r: p.r, p: p.p, salt: p.salt, hash: p.hash },
-      display_name: u.display_name, handle: u.handle, balance: u.balance });
+      display_name: u.display_name, handle: u.handle, balance: u.balance, opening: ledger ? u.opening : u.balance });
   }
   for (const t of s.tokens) {
     need(Array.isArray(t) && t.length === 2 && str(t[0]) && st.users.has(t[1]), 'token');
     st.tokens.set(t[0], t[1]);
   }
-  const ts = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
+  const ts = (v) => parseInstant(v) !== null;
   const note = (v) => typeof v === 'string';
   const pids = new Set();
   for (const p of s.payments) {
@@ -355,6 +500,34 @@ function importState(doc) {
       request_id: p.request_id, settlement_id: p.settlement_id, authorization_id: authId, created_at: p.created_at,
     });
   }
+  // Feed and ledger order is by created_at (stable for equal instants).
+  st.payments = st.payments.map((p, i) => [p, parseInstant(p.created_at), i])
+    .sort((x, y) => (x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : x[2] - y[2])).map((x) => x[0]);
+  const payById = new Map(st.payments.map((p) => [p.payment_id, p]));
+  if (ledger) {
+    for (const e of s.revisions) {
+      need(Array.isArray(e) && e.length === 2 && payById.has(e[0]) && !st.revs.has(e[0]) && Array.isArray(e[1]) && e[1].length >= 1, 'revisions');
+      const p = payById.get(e[0]);
+      const revs = e[1].map((r, i) => {
+        need(isObj(r) && r.revision === i + 1 && Number.isInteger(r.amount) && r.amount >= 0 && r.amount <= MAX_AMOUNT
+          && typeof r.reason === 'string' && ts(r.effective_at) && ts(r.recorded_at), 'revision fields');
+        return revision(r.revision, r.amount, r.effective_at, r.recorded_at, r.reason);
+      });
+      need(revs[0].amount === p.amount && revs[0].effective_at === p.created_at && revs[0].recorded_at === p.created_at && revs[0].reason === '', 'original revision');
+      for (let i = 1; i < revs.length; i++) need(revs[i].recNs > revs[i - 1].recNs, 'recorded_at order');
+      st.revs.set(e[0], revs);
+    }
+    need(st.revs.size === st.payments.length, 'every payment needs revisions');
+  } else {
+    for (const p of st.payments) recordOriginal(st, p);
+    for (const p of st.payments) {
+      st.users.get(p.from_user_id).opening += p.amount;
+      st.users.get(p.to_user_id).opening -= p.amount;
+    }
+  }
+  // Ledger identity: each balance = opening + net of the latest revisions.
+  const farFuture = nsOfMs(MAX_DATE_MS) * 2n;
+  for (const u of st.users.values()) need(totalAt(st, u, farFuture, farFuture) === u.balance, 'balance does not match the ledger');
   for (const a of sAuths) {
     need(isObj(a) && str(a.id) && a.id.length <= 64 && !st.auths.has(a.id), 'authorization id');
     need(st.users.has(a.from_user_id) && st.users.has(a.to_user_id) && a.from_user_id !== a.to_user_id, 'authorization users');
@@ -364,7 +537,23 @@ function importState(doc) {
     need(note(a.note) && cpLen(a.note) <= 200 && (a.visibility === 'public' || a.visibility === 'private') && AUTH_STATUSES.includes(a.status), 'authorization fields');
     need(!Number.isNaN(rfc3339Ms(a.expires_at)) && !Number.isNaN(rfc3339Ms(a.created_at)), 'authorization times');
     need(a.status !== 'open' || a.captured_amount < a.amount, 'open authorization without remainder');
-    st.auths.set(a.id, loadAuth(a));
+    // Lifecycle fields are derived for holds that lack them (stage-1/2 exports, older records).
+    if (a.captures !== undefined) {
+      need(Array.isArray(a.captures) && a.captures.every((c) => isObj(c) && ts(c.at) && Number.isInteger(c.amount) && c.amount >= 1)
+        && Number.isInteger(a.base_captured) && a.base_captured >= 0 && typeof a.seeded_closed === 'boolean'
+        && (a.closed_at === null || ts(a.closed_at)), 'authorization lifecycle');
+      need(a.base_captured + a.captures.reduce((x, c) => x + c.amount, 0) === a.captured_amount, 'authorization captures');
+      st.auths.set(a.id, loadAuth(a));
+    } else {
+      // Derive the lifecycle from the capture payments; a closed hold without a recorded close time
+      // is taken to close at its latest known event (last capture, else creation), never overstating holds.
+      const caps = st.payments.filter((p) => p.authorization_id === a.id).map((p) => ({ at: p.created_at, amount: p.amount }));
+      const capSum = caps.reduce((x, c) => x + c.amount, 0);
+      need(capSum <= a.captured_amount, 'authorization captures');
+      const closedAt = a.status === 'open' ? null : a.status === 'expired' ? a.expires_at : (caps.length ? caps[caps.length - 1].at : a.created_at);
+      st.auths.set(a.id, loadAuth({ ...a, captures: caps, base_captured: a.captured_amount - capSum, closed_at: closedAt,
+        seeded_closed: a.status === 'expired' }));
+    }
   }
   // available = total - held must not be negative for any user in the imported state.
   const importNow = clockMs();
@@ -391,6 +580,16 @@ function importState(doc) {
   for (const id of pids) st.used.add(id);
   for (const id of st.requests.keys()) st.used.add(id);
   for (const id of st.auths.keys()) st.used.add(id);
+  if (ledger) {
+    for (const e of s.snapshots) {
+      need(Array.isArray(e) && e.length === 2 && str(e[0]) && isObj(e[1]) && st.users.has(e[1].owner)
+        && Number.isSafeInteger(e[1].opening_balance) && Number.isSafeInteger(e[1].closing_balance)
+        && Array.isArray(e[1].entries) && isObj(e[1].echo), 'snapshot');
+      st.snapshots.set(e[0], e[1]);
+    }
+  }
+  // Raise the clock past every imported instant so new events sort after imported history.
+  st.clockFloorMs = Math.max(stateClockMs(st), ledger ? Math.min(s.clock_ms, MAX_DATE_MS) : 0);
   return st;
 }
 
@@ -456,6 +655,7 @@ function makePayment(st, from, to, amount, note, visibility, requestId, settleme
   from.balance -= amount;
   to.balance += amount;
   st.payments.push(p);
+  recordOriginal(st, p);
   return p;
 }
 
@@ -497,6 +697,7 @@ const ops = {
     const a = {
       id: newId(st, 'a_'), from_user_id: me.id, to_user_id: to.id, amount, captured_amount: 0, payment_ids: [],
       note, visibility, status: 'open', expires_at: isoOf(expMs), created_at: isoOf(now), expMs, createdMs: now,
+      expNs: nsOfMs(expMs), createdNs: nsOfMs(now), captures: [], baseCaptured: 0, closed_at: null, closedNs: null, seededClosed: false,
     };
     st.auths.set(a.id, a);
     return authView(st, a, now);
@@ -520,7 +721,12 @@ const ops = {
     const p = makePayment(st, st.users.get(a.from_user_id), me, amount, a.note, a.visibility, null, null, isoOf(now), a.id);
     a.captured_amount += amount;
     a.payment_ids.push(p.payment_id);
-    if (final || a.captured_amount === a.amount) a.status = 'captured';
+    a.captures.push({ at: p.created_at, amount, ns: nsOfMs(now) });
+    if (final || a.captured_amount === a.amount) {
+      a.status = 'captured';
+      a.closed_at = p.created_at;
+      a.closedNs = nsOfMs(now);
+    }
     return p;
   },
 
@@ -607,6 +813,7 @@ const ops = {
         note: x.note, visibility: x.visibility, request_id: null, settlement_id: sid, authorization_id: null, created_at: ts,
       };
       st.payments.push(p);
+      recordOriginal(st, p);
       return p;
     });
     for (const [uid, d] of delta) st.users.get(uid).balance += d;
@@ -667,6 +874,92 @@ function idempotent(req, res, raw, path, opName, opts) {
   send(res, 201, result);
 }
 
+// ---------- temporal reads ----------
+// Optional RFC 3339 query instant: absent -> undefined; present but empty/invalid -> 422.
+function queryInstant(q, name) {
+  if (!q.has(name)) return undefined;
+  const raw = q.get(name);
+  const ns = parseInstant(raw);
+  if (ns === null) throw invalid(`${name} must be an RFC 3339 instant with an offset`);
+  return { raw, ns };
+}
+
+function meAt(st, me, q) {
+  const asOf = queryInstant(q, 'as_of');
+  const knownAt = queryInstant(q, 'known_at');
+  const startMs = clockMs();
+  if (!asOf && !knownAt) {
+    const held = heldOf(st, me.id, startMs);
+    return { user_id: me.id, display_name: me.display_name, handle: me.handle, balance: me.balance,
+      total: me.balance, available: me.balance - held, held, currency: st.currency, minor_units: st.minorUnits };
+  }
+  const start = nsOfMs(startMs);
+  const T = asOf ? asOf.ns : start, K = knownAt ? knownAt.ns : start;
+  const total = totalAt(st, me, T, K);
+  const held = heldAt(st, me.id, T, K);
+  const out = { user_id: me.id, display_name: me.display_name, handle: me.handle, balance: total,
+    total, available: total - held, held, currency: st.currency, minor_units: st.minorUnits };
+  if (asOf) out.as_of = asOf.raw;
+  if (knownAt) out.known_at = knownAt.raw;
+  return out;
+}
+
+function newSnapshotToken(st) {
+  let t;
+  do { t = 'ss_' + crypto.randomBytes(18).toString('hex'); } while (st.snapshots.has(t));
+  return t;
+}
+function statementPage(token, snap, pg) {
+  const p = page(snap.entries, pg);
+  return { ...snap.echo, opening_balance: snap.opening_balance, entries: p.items,
+    closing_balance: snap.closing_balance, has_more: p.has_more, snapshot: token };
+}
+function statement(st, me, q) {
+  if (q.has('snapshot')) {
+    if (q.has('from') || q.has('to') || q.has('known_at')) throw invalid('a snapshot takes only limit and offset');
+    const pg = pageParams(q);
+    const token = q.get('snapshot');
+    const snap = st.snapshots.get(token);
+    if (!snap || snap.owner !== me.id) throw notFound('no such statement snapshot');
+    return statementPage(token, snap, pg);
+  }
+  const from = queryInstant(q, 'from');
+  const to = queryInstant(q, 'to');
+  const knownAt = queryInstant(q, 'known_at');
+  const pg = pageParams(q);
+  if (from && to && from.ns > to.ns) throw invalid('from must not be after to');
+  const start = nsOfMs(clockMs());
+  const K = knownAt ? knownAt.ns : start;
+  const toNs = to ? to.ns : start;
+  // Every payment of the caller with a revision known at K, placed at its selected effective time.
+  const rows = [];
+  for (const p of st.payments) {
+    if (p.from_user_id !== me.id && p.to_user_id !== me.id) continue;
+    const r = selectRev(st.revs.get(p.payment_id), K);
+    if (r) rows.push({ p, r, delta: signedFor(p, me.id, r.amount) });
+  }
+  rows.sort((x, y) => (x.r.effNs < y.r.effNs ? -1 : x.r.effNs > y.r.effNs ? 1
+    : x.p.payment_id < y.p.payment_id ? -1 : x.p.payment_id > y.p.payment_id ? 1 : 0));
+  let opening = me.opening;
+  for (const x of rows) if (from && x.r.effNs < from.ns) opening += x.delta;
+  let running = opening;
+  const entries = [];
+  for (const x of rows) {
+    if ((from && x.r.effNs < from.ns) || x.r.effNs >= toNs) continue;
+    running += x.delta;
+    entries.push({ payment: { ...x.p, amount: x.r.amount }, delta: x.delta, balance_after: running,
+      revision: x.r.revision, effective_at: x.r.effective_at, recorded_at: x.r.recorded_at });
+  }
+  const echo = {};
+  if (from) echo.from = from.raw;
+  if (to) echo.to = to.raw;
+  if (knownAt) echo.known_at = knownAt.raw;
+  const snap = clone({ owner: me.id, echo, opening_balance: opening, closing_balance: running, entries });
+  const token = newSnapshotToken(st);
+  st.snapshots.set(token, snap);
+  return statementPage(token, snap, pg);
+}
+
 function decideRequest(st, me, id, action) {
   const r = st.requests.get(id);
   if (!r) throw notFound('no such request');
@@ -687,6 +980,8 @@ function voidAuthorization(st, me, id) {
   if (a.status === 'voided') return authView(st, a, now);
   if (effStatus(a, now) !== 'open') throw new ApiError(409, 'authorization_not_open', 'authorization is not open');
   a.status = 'voided';
+  a.closed_at = isoOf(now);
+  a.closedNs = nsOfMs(now);
   return authView(st, a, now);
 }
 
@@ -711,7 +1006,7 @@ async function signup(req, res, raw) {
   conflicts(st);
   const pwd = await hashPassword(password);
   conflicts(st);
-  const user = { id: newId(st, 'u_'), email, pwd, display_name, handle, balance: 0 };
+  const user = { id: newId(st, 'u_'), email, pwd, display_name, handle, balance: 0, opening: 0 };
   insertUser(st, user);
   send(res, 201, { user_id: user.id, display_name, token: issueToken(st, user.id) });
 }
@@ -777,16 +1072,20 @@ const ROUTES = [
   ['GET', /^\/_test\/export$/, (req, res) => send(res, 200, exportState(state))],
   ['POST', /^\/_test\/import$/, (req, res, raw) => {
     const doc = parseObjBody(raw);
-    state = importState(doc);
+    const next = importState(doc);
+    lastMs = Math.max(lastMs, next.clockFloorMs || 0);
+    state = next;
     send(res, 204);
   }],
   ['POST', /^\/auth\/signup$/, signup],
   ['POST', /^\/auth\/login$/, login],
-  ['GET', /^\/me$/, (req, res) => {
+  ['GET', /^\/me$/, (req, res, raw, m, path, q) => {
     const st = state, me = authenticate(st, req);
-    const held = heldOf(st, me.id, clockMs());
-    send(res, 200, { user_id: me.id, display_name: me.display_name, handle: me.handle, balance: me.balance,
-      total: me.balance, available: me.balance - held, held, currency: st.currency, minor_units: st.minorUnits });
+    send(res, 200, meAt(st, me, q));
+  }],
+  ['GET', /^\/statement$/, (req, res, raw, m, path, q) => {
+    const st = state, me = authenticate(st, req);
+    send(res, 200, statement(st, me, q));
   }],
   ['POST', /^\/payments$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'payments', {})],
   ['POST', /^\/requests$/, (req, res, raw, m, path) => idempotent(req, res, raw, path, 'requests', {})],
@@ -859,6 +1158,20 @@ const ROUTES = [
     idempotent(req, res, raw, path, 'settlements', { operatorOnly: true })],
 ];
 
+// Query parameters: percent-decoded, but a raw '+' stays '+' (instants carry '+HH:MM' offsets).
+// The first occurrence of a repeated name wins.
+function parseQuery(search) {
+  const map = new Map();
+  for (const part of search.replace(/^\?/, '').split('&')) {
+    if (!part) continue;
+    const i = part.indexOf('=');
+    const dec = (x) => { try { return decodeURIComponent(x); } catch { return x; } };
+    const k = dec(i < 0 ? part : part.slice(0, i)), v = i < 0 ? '' : dec(part.slice(i + 1));
+    if (!map.has(k)) map.set(k, v);
+  }
+  return map;
+}
+
 function decodeMatch(m) {
   return m.map((s, i) => (i === 0 ? s : decodeURIComponent(s)));
 }
@@ -907,7 +1220,7 @@ const server = http.createServer((req, res) => {
     }
     chunks.push(c);
   });
-  req.on('end', () => { if (!aborted) handle(req, res, Buffer.concat(chunks), path, url.searchParams, route, m); });
+  req.on('end', () => { if (!aborted) handle(req, res, Buffer.concat(chunks), path, parseQuery(url.search), route, m); });
   req.on('error', () => {});
 });
 server.keepAliveTimeout = 65000;
@@ -919,4 +1232,4 @@ server.on('clientError', (err, socket) => {
     socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
   } else socket.destroy();
 });
-server.listen(PORT, '0.0.0.0', () => console.log(`pocketful stage 2 listening on 0.0.0.0:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`pocketful stage 3 listening on 0.0.0.0:${PORT}`));

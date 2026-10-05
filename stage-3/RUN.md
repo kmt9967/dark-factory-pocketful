@@ -19,3 +19,8 @@ Screens: `/` wallet, pay, request and activity · `/requests` · `/split` · `/a
 the JSON API otherwise. The UI's script and styles are served from `/assets/`.
 
 Without Docker: `PORT=8080 node stage-3/server.js` (Node.js 22).
+
+Ledger reads (stage 3): `GET /me?as_of=<RFC 3339>&known_at=<RFC 3339>` returns historical
+balance/available/held, and `GET /statement?from=&to=&known_at=&limit=&offset=` returns a paginated
+statement with a `snapshot` token (`GET /statement?snapshot=<token>&limit=&offset=` pages it).
+Write the offset's `+` raw or as `%2B`; both mean `+`.
