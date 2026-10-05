@@ -213,3 +213,8 @@ All stage-1 items 1–78 and stage-2 items 79–121 continue to hold.
   I18 historical check (total and available), linked-payment immutability, statement/known_at behaviour with
   multiple revisions, and snapshot immutability across corrections. Items 135–140, 145–147, 151 and 154.
 - Verifier gate on the accepted W3b revision.
+
+## Amendments
+
+- G9 (review of 4b6bc73, F1): the clock floor raised by import (and anything else derived from state) is capped at wall-clock now. Only instants the server actually observed count (payment/request created_at, revision recorded_at, capture/void event times, committed_at), never deadline-derived values (expires_at used as closed_at) or future-dated seeded instants. Reset never raises the clock beyond wall-clock now. A new write after any import/reset gets created_at within a second of wall time.
+- G10 (advisory A1 → required): snapshots are stored compactly. Each entry keeps (payment id, revision number, delta, balance_after); the payment view is re-rendered at paging time from immutable data (the original payment + the selected revision's amount/effective/recorded), which yields identical output. Memory per snapshot is O(entries) small records, with no deep clones of payment bodies.
