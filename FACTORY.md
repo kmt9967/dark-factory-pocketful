@@ -140,3 +140,7 @@ empty repository containing only the mandates.
   throw away, or in Docker Sandboxes where the host supports them (not available on our Windows 10 host).
 - The verifier can only run the *shipped* part of each suite; hidden-suite coverage depends on the reviewer's
   spec-driven probes.
+
+- `room.json` contains four `error` events from the Implementer: four of its background harness runs exited non-zero.
+  These were the Implementer's own in-progress check runs, three of them against a not-yet-finished stage; each was
+  followed by a passing run before it handed the work on. They are left in the export unchanged.
